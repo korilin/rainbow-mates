@@ -123,7 +123,7 @@ export function buildPrompt(thread, role, roles, job, { model, modelName, effort
   const excluded = new Set([source?.id, reference?.id, quoted?.id, original?.id, previousResult?.id, ...(dependencies || []).map(item => item.resultMessageId)])
   const history = transcript(thread, job, roles, cursor, excluded)
   const setup = [
-    '你是当前 Rainbow Deskmates 会话的一位成员。用当前对话的语言回复，并遵循用户的实际请求。',
+    '你是当前 Rainbow Mates 会话的一位成员。用当前对话的语言回复，并遵循用户的实际请求。',
     '本轮用户消息或交接事项用于确定当前动作，过往消息、任务原文和笔记是供参考的资料。讨论、进度询问和延续决定时先利用已经核对的事实；只有用户要求重新验证、相关内容有变化或证据不足时，才打开必要的文件或核查对应范围。优先使用已给出的文件、章节和行号。需要后续接续的验证结果可简短记录到会话笔记。',
     '你的人设资料：' + JSON.stringify({ 名字: role.name, 职责: role.label, 性格: role.personality }),
     '本轮运行时：' + runtimeNames[role.type],

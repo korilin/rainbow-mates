@@ -1,12 +1,21 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu } from 'electron'
 import { fileURLToPath } from 'node:url'
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import metadata from '../package.json' with { type: 'json' }
 import { Store } from './store.mjs'
 import { Conversations } from './conversations.mjs'
 
-app.setName('Rainbow Deskmates')
-if (process.env.RDS_USER_DATA_DIR) app.setPath('userData', resolve(process.env.RDS_USER_DATA_DIR))
+app.setName(metadata.productName)
+if (process.env.RDS_USER_DATA_DIR) {
+  app.setPath('userData', resolve(process.env.RDS_USER_DATA_DIR))
+} else {
+  // Existing installations can keep their working directory and native session paths.
+  const legacyData = join(app.getPath('appData'), 'Rainbow Deskmates')
+  if (existsSync(join(legacyData, 'workspace.json')) && !existsSync(join(app.getPath('userData'), 'workspace.json'))) {
+    app.setPath('userData', legacyData)
+  }
+}
 const ready = app.requestSingleInstanceLock()
 let window
 let conversations
@@ -19,7 +28,7 @@ function notify(name, data) {
 
 function openWindow() {
   window = new BrowserWindow({
-    title: 'Rainbow Deskmates',
+    title: metadata.productName,
     icon,
     width: 1440, height: 920, minWidth: 660, minHeight: 560,
     backgroundColor: '#f9f8fc',

@@ -8,7 +8,7 @@ import {
   Send, Settings, Sparkles, Square, Trash2, UserRound, UsersRound, X,
 } from 'lucide-react'
 import '@fontsource-variable/nunito'
-import { version } from '../package.json'
+import { productName, version } from '../package.json'
 import { findMentions } from '../shared/mentions.mjs'
 import './style.css'
 
@@ -335,7 +335,7 @@ function SideBar({ state, page, navigate, show, close, command, openMenu }) {
     <section className="sidebar-top">
       <div className="workspace-title">
         <img className="workspace-logo" src={appIcon} alt="" />
-        <div><strong>Rainbow Deskmates</strong><small>v{version}</small></div>
+        <div><strong>{productName}</strong><small>v{version}</small></div>
       </div>
       <div className="nav-switch" aria-label="工作区导航">
         <button aria-pressed={page === 'chat'} onClick={() => { navigate('chat'); close() }}><MessageSquare size={16} /> 会话</button>
@@ -761,7 +761,7 @@ function App() {
     return () => query.removeEventListener('change', update)
   }, [])
   useEffect(() => {
-    if (!api) { setLoadingError('请用 npm start 打开 Rainbow Deskmates 桌面应用。'); return }
+    if (!api) { setLoadingError('请用 npm start 打开 ' + productName + ' 桌面应用。'); return }
     let alive = true
     let received = false
     const offChange = api.onChange(value => {
@@ -809,7 +809,7 @@ function App() {
   return <div className="app">
     <header className="titlebar">
       <button type="button" className="icon-button titlebar-nav" aria-label="切换会话导航" onClick={() => setSidebar(!sidebar)}><PanelLeft size={18} /></button>
-      <div className="desktop-brand"><img src={appIcon} alt="" /><strong>Rainbow Deskmates</strong></div>
+      <div className="desktop-brand"><img src={appIcon} alt="" /><strong>{productName}</strong></div>
       <div className="titlebar-actions">
         <IconButton icon={Settings} label="运行时设置" onClick={() => show({ type: 'settings' })} />
       </div>

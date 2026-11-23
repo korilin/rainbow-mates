@@ -1,10 +1,10 @@
-# Rainbow Deskmates
+# Rainbow Mates
 
 把本机的 Codex 和 DeepSeek Harness (DSH) 放进同一个桌面会话。每个角色有自己的名字、角色标签、性格和形象。
 
 ## 启动
 
-macOS 应用包可以放进「应用程序」，通过 Spotlight 搜索 **Rainbow Deskmates** 打开。应用调用本机已安装并完成登录的 Codex 和 DSH。
+macOS 应用包可以放进「应用程序」，通过 Spotlight 搜索 **Rainbow Mates** 打开。应用调用本机已安装并完成登录的 Codex 和 DSH。
 
 从源码启动或打包需要 Node.js 22.12 或更新版本。
 
@@ -29,7 +29,7 @@ npm start
 - Agent 可在工作过程中增删会话笔记，记录关键决定和进度。笔记按会话保存为 Markdown，设置栏中可以按文件打开或删除。新开的运行时会话会读取近期笔记，续聊会收到笔记变更。交接时可在说明中写出笔记文件名，应用会优先提供相关内容。
 - 工作目录默认只读。选择本地目录后可针对该会话开启写权限。
 
-程序和聊天记录都在本机。运行时会使用各自已配置的模型服务，共享消息上下文会作为输入发给这些服务。Rainbow Deskmates 的聊天、配置和运行时会话映射保存在 Electron 用户数据目录的 `workspace.json`，macOS 默认位于 `~/Library/Application Support/Rainbow Deskmates/`。
+程序和聊天记录都在本机。运行时会使用各自已配置的模型服务，共享消息上下文会作为输入发给这些服务。Rainbow Mates 的聊天、配置和运行时会话映射保存在 Electron 用户数据目录的 `workspace.json`，新安装在 macOS 上默认使用 `~/Library/Application Support/Rainbow Mates/`。旧版升级会继续使用已有的数据目录。
 
 ## 实现
 
@@ -40,6 +40,6 @@ npm test
 npm run build
 ```
 
-协作功能参考了 [Raft](https://raft.build/zh-cn/) 的成员、私有收件目标、回复线程和交接设计。界面和实现为 Rainbow Deskmates 独立制作。
+协作功能参考了 [Raft](https://raft.build/zh-cn/) 的成员、私有收件目标、回复线程和交接设计。界面和实现为 Rainbow Mates 独立制作。
 
 角色素材来源及使用说明见 [素材署名](./public/art/NOTICE.md)。

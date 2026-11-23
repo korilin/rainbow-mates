@@ -41,7 +41,7 @@ function queryCatalog({ binary, cwd, args, initial, follow, initialized, jsonrpc
 async function codexCatalog(binary, cwd) {
   const result = await queryCatalog({
     binary, cwd, args: ['app-server', '--listen', 'stdio://'],
-    initial: { method: 'initialize', params: { clientInfo: { name: 'rainbow_deskmates', version: '0.1.0' } } },
+    initial: { method: 'initialize', params: { clientInfo: { name: 'rainbow_mates', version: '0.1.0' } } },
     initialized: { method: 'initialized' },
     follow: { method: 'model/list', params: { includeHidden: false } },
   })
