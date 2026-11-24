@@ -17,6 +17,7 @@ import { readAssetPreview, streamAsset } from './content.mjs'
 import { PanelBrowser } from './panel-browser.mjs'
 import { workspaceAsset, workspaceEntries, workspaceReferencePath } from './workspace-files.mjs'
 import { fileClipboardPaths } from './file-clipboard.mjs'
+import { previewUserAvatar, saveUserProfile, userAvatarResponse } from './user-profile.mjs'
 import { appTheme, canvasColor } from '../shared/theme.mjs'
 
 protocol.registerSchemesAsPrivileged([{ scheme: 'rainbow-content', privileges: { standard: true, secure: true, stream: true } }])
@@ -124,6 +125,7 @@ else {
     if (!app.isPackaged) app.dock?.setIcon(icon)
     const data = app.getPath('userData')
     const work = join(data, 'workspace')
+    const profileDirectory = join(data, 'profile-avatars')
     const computer = new ComputerBridge(createMacDesktop())
     const references = new References()
     mkdirSync(work, { recursive: true, mode: 0o700 })
@@ -162,6 +164,13 @@ else {
     ipcMain.on('rainbow:clipboard-files', (event) => {
       event.returnValue = event.sender === window?.webContents && event.senderFrame === event.sender.mainFrame ? fileClipboardPaths() : []
     })
+    ipcMain.handle('rainbow:profile-pick-avatar', guard(async () => {
+      const result = await dialog.showOpenDialog(window, {
+        title: '选择头像', properties: ['openFile'], filters: [{ name: '头像图片', extensions: ['png', 'jpg', 'jpeg'] }],
+      })
+      return result.canceled || !result.filePaths[0] ? null : previewUserAvatar(result.filePaths[0])
+    }))
+    ipcMain.handle('rainbow:profile-save', guard(profile => saveUserProfile(conversations, profileDirectory, profile)))
     ipcMain.handle('rainbow:content-asset', guard(async (threadId, messageId, id) =>
       readAssetPreview(await conversations.messageAsset(threadId, messageId, id))))
     ipcMain.handle('rainbow:content-save', guard(saveAttachment))
@@ -171,6 +180,9 @@ else {
         const url = new URL(request.url)
         const parts = url.pathname.slice(1).split('/').map(decodeURIComponent)
         if (!['GET', 'HEAD'].includes(request.method)) return new Response(null, { status: 405 })
+        if (url.hostname === 'profile' && parts.length === 1) {
+          return await userAvatarResponse(profileDirectory, parts[0], conversations.store.value.settings.profile, request.method)
+        }
         if (url.hostname === 'asset' && parts.length === 3) return streamAsset(await conversations.messageAsset(...parts), request)
         if (url.hostname === 'workspace' && parts.length === 2) return streamAsset(await workspaceAsset(cwdFor(parts[0]), parts[1]), request)
         if (url.hostname === 'reference' && parts.length === 2) {

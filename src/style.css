@@ -152,7 +152,8 @@ svg { flex: 0 0 auto; }
 .avatar img { width: 100%; height: 155%; object-fit: cover; object-position: center top; align-self: start; transform: translateY(-12%); }
 .avatar.standee img { height: 215%; transform: translateY(-7%); }
 .avatar.deepseek { background: var(--fish-art); border-color: var(--fish-edge); }
-.avatar-user { background: var(--soft); }
+.avatar-user { background: var(--soft); font-weight: 800; }
+.avatar-user img { height: 100%; object-position: center; transform: none; }
 .avatar.small { width: 30px; height: 30px; border-radius: 10px; }
 .avatar.tiny { width: 24px; height: 24px; border-radius: 8px; }
 .avatar-group .avatar { border: 2px solid var(--surface); width: 21px; height: 21px; border-radius: 7px; }
@@ -424,6 +425,8 @@ svg { flex: 0 0 auto; }
 .markdown-table :is(th, td) { padding: 4px 8px; border: 1px solid var(--stroke); }
 .markdown-table th { background: var(--selected); }
 .mention-copy { color: var(--deep-accent); background: var(--selected); border-radius: 4px; padding: 1px 4px; font-weight: 800; box-decoration-break: clone; }
+.conversation-reference { border: 0; font-size: inherit; }
+.conversation-reference:hover { background: var(--reference-hover); }
 .message-actions { display: flex; align-items: center; gap: 2px; margin-top: 2px; }
 .message-actions .icon-button { width: 24px; height: 23px; color: var(--muted); }
 .message-actions .icon-button svg { width: 14px; height: 14px; }
@@ -494,15 +497,14 @@ svg { flex: 0 0 auto; }
   box-shadow: 0 5px 18px var(--shadow); font-size: 12px;
 }
 .sidebar-feedback.failed { color: var(--danger); }
-.mentions-menu { left: 8px; }
-.mentions-menu .model-badge { margin-left: auto; }
 .reference-picker { left: 8px; width: min(410px, calc(100% - 16px)); }
-.reference-picker-tabs { display: flex; gap: 3px; }
-.reference-picker-tabs button { justify-content: center; padding: 7px 5px; }
-.reference-picker-tabs button[aria-pressed="true"] { color: var(--deep-accent); background: var(--soft); font-weight: 750; }
-.reference-picker input { width: 100%; padding: 7px 8px; margin-top: 5px; border: 1px solid var(--stroke); border-radius: 6px; background: var(--field); color: var(--ink); }
-.reference-results { max-height: 238px; overflow: auto; }
+.reference-picker input { width: 100%; padding: 7px 8px; margin: 4px 0; border: 1px solid var(--stroke); border-radius: 6px; background: var(--field); color: var(--ink); }
+.reference-results { max-height: 270px; overflow: auto; }
 .reference-results button { align-items: center; justify-content: space-between; padding-block: 7px; }
+.reference-results button[aria-selected="true"] { background: var(--selected); color: var(--deep-accent); }
+.reference-group-heading { display: block; padding: 5px 7px; color: var(--muted); font-size: 10px; font-weight: 750; }
+.reference-group + .reference-group { margin-top: 4px; }
+.reference-results button.plugin-skill-option { padding-inline-start: 23px; }
 .reference-result-name { flex: 1; min-width: 0; }
 .reference-result-name :is(strong, small) { display: block; overflow: hidden; text-overflow: ellipsis; }
 .reference-result-name small, .reference-runtime, .reference-picker-note { color: var(--muted); font-size: 10px; }
@@ -574,7 +576,10 @@ dialog::backdrop { background: var(--scrim); }
 .dialog-inner :is(input:not([type="checkbox"], [type="radio"]), textarea, select) { min-width: 0; width: 100%; border: 1px solid var(--stroke); border-radius: 8px; background: var(--field); color: var(--ink); padding: 7px 8px; font-size: 12px; font-weight: 500; }
 .dialog-inner textarea { resize: vertical; min-height: 64px; }
 .dialog-inner input::placeholder, .dialog-inner textarea::placeholder { color: var(--muted); }
-.appearance-settings { padding-bottom: 15px; margin-bottom: 15px; border-bottom: 1px solid var(--stroke); }
+.profile-settings, .appearance-settings { padding-bottom: 15px; margin-bottom: 15px; border-bottom: 1px solid var(--stroke); }
+.profile-avatar-controls, .profile-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.profile-avatar-controls .profile-preview { width: 48px; height: 48px; margin-left: 0; }
+.profile-actions { justify-content: flex-end; }
 .theme-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
 .dialog-inner .theme-options label {
   position: relative; flex-direction: row; align-items: center; gap: 7px; min-height: 36px; padding: 7px 9px;

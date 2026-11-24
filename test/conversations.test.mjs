@@ -46,6 +46,33 @@ test('appearance settings persist independently of runtime paths', async t => {
   assert.equal(new Store(file).value.settings.theme, 'light')
 })
 
+test('inline references keep runtime metadata and do not accidentally mention members', async t => {
+  const calls = []
+  const { app, store } = workspace(t, async call => { calls.push(call); return { text: '[略过]' } })
+  app.references = new References()
+  const [plugin] = app.references.register('clubroom', [{ kind: 'plugin', name: 'Codex 龙娘', runtime: 'codex', key: 'same-name' }])
+  store.mutate(state => {
+    state.threads.find(thread => thread.id === 'ideas').messages.push({ id: 'context', at: 1, text: '明确同意的关联会话内容' })
+  })
+  const text = '@Codex 龙娘 参考 @灵感收集站'
+  const spans = [
+    { kind: 'plugin', id: plugin.id, symbol: '@', start: 0, end: '@Codex 龙娘'.length },
+    { kind: 'conversation', id: 'conversation:ideas', symbol: '@', start: text.indexOf('@灵感'), end: text.length },
+  ]
+  assert.throws(() => app.dispatch('send', { threadId: 'clubroom', text, inlineReferences: [{ ...spans[0], end: 2 }] }), /已失效/)
+  app.dispatch('send', { threadId: 'clubroom', text, inlineReferences: spans })
+  await settled(app)
+  const message = app.snapshot().threads[0].messages[0]
+  assert.deepEqual(message.inlineReferences, spans)
+  assert.equal(message.targetIds, undefined)
+  const codex = calls.find(call => call.type === 'codex')
+  const deepseek = calls.find(call => call.type === 'deepseek')
+  assert.deepEqual(codex.references.map(item => item.kind), ['plugin', 'conversation'])
+  assert.deepEqual(deepseek.references.map(item => item.kind), ['conversation'])
+  assert.match(codex.prompt, /明确同意的关联会话内容/)
+  assert.match(deepseek.prompt, /明确同意的关联会话内容/)
+})
+
 test('mentions are exact, case insensitive and can target names containing spaces', () => {
   const roles = [{ id: 'a', name: 'DeepSeek' }, { id: 'b', name: 'DeepSeek 娘' }, { id: 'c', name: '研发龙' }]
   assert.deepEqual(mentionTargets('你好 @deepseek 娘，@{研发龙} 请确认。', roles).sort(), ['b', 'c'])
@@ -487,27 +514,29 @@ test('handoff enriches an already queued role and brings referenced notes to a r
   assert.match(calls[3].prompt, /本轮指定的交接事项/)
 })
 
-test('a missing native session is rebuilt once with notes and unrelated runtime errors are not retried', async t => {
-  const calls = []
-  const { app, store } = workspace(t, async call => {
-    calls.push(call)
-    if (calls.length === 2) throw Object.assign(new Error('missing session'), { code: 'RDS_SESSION_MISSING' })
-    if (calls.length === 4) throw new Error('runtime interrupted')
-    return { text: '回复', sessionId: 'session-' + calls.length }
+for (const [problem, code] of [['missing', 'RDS_SESSION_MISSING'], ['occupied', 'RDS_SESSION_BUSY']]) {
+  test(`an ${problem} native session is rebuilt once with notes and unrelated runtime errors are not retried`, async t => {
+    const calls = []
+    const { app, store } = workspace(t, async call => {
+      calls.push(call)
+      if (calls.length === 2) throw Object.assign(new Error(problem), { code })
+      if (calls.length === 4) throw new Error('runtime interrupted')
+      return { text: '回复', sessionId: 'session-' + calls.length }
+    })
+    const threadId = 'clubroom'
+    app.notes.write(threadId, '决策.md', 'RECOVER-THIS-NOTE')
+    for (const text of ['FIRST-REQUEST', 'SECOND-REQUEST', 'THIRD-REQUEST']) {
+      app.dispatch('send', { threadId, text, targetIds: ['codex'] })
+      await settled(app)
+    }
+    assert.deepEqual(calls.map(call => call.sessionId), [undefined, 'session-1', undefined, 'session-3'])
+    assert.doesNotMatch(calls[1].prompt, /RECOVER-THIS-NOTE|FIRST-REQUEST/)
+    assert.match(calls[2].prompt, /RECOVER-THIS-NOTE/)
+    assert.match(calls[2].prompt, /FIRST-REQUEST[\s\S]*SECOND-REQUEST/)
+    assert.equal(store.value.threads[0].sessions.codex.messageId, store.value.threads[0].messages[3].id)
+    assert.equal(app.snapshot().threads[0].messages.at(-1).error, 'runtime interrupted')
   })
-  const threadId = 'clubroom'
-  app.notes.write(threadId, '决策.md', 'RECOVER-THIS-NOTE')
-  for (const text of ['FIRST-REQUEST', 'SECOND-REQUEST', 'THIRD-REQUEST']) {
-    app.dispatch('send', { threadId, text, targetIds: ['codex'] })
-    await settled(app)
-  }
-  assert.deepEqual(calls.map(call => call.sessionId), [undefined, 'session-1', undefined, 'session-3'])
-  assert.doesNotMatch(calls[1].prompt, /RECOVER-THIS-NOTE|FIRST-REQUEST/)
-  assert.match(calls[2].prompt, /RECOVER-THIS-NOTE/)
-  assert.match(calls[2].prompt, /FIRST-REQUEST[\s\S]*SECOND-REQUEST/)
-  assert.equal(store.value.threads[0].sessions.codex.messageId, store.value.threads[0].messages[3].id)
-  assert.equal(app.snapshot().threads[0].messages.at(-1).error, 'runtime interrupted')
-})
+}
 
 test('all member chat lanes get ordered messages and preserve the session after a silent turn', async t => {
   const calls = []

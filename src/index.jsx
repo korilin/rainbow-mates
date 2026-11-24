@@ -15,6 +15,7 @@ import { DEFAULT_THREAD_GROUP } from '../shared/thread-groups.mjs'
 import { workspaceFileDrag } from '../shared/file-drop.mjs'
 import { appTheme } from '../shared/theme.mjs'
 import { mediaType, referenceImageURL } from '../shared/content-links.mjs'
+import { inlineReferenceName, rebaseReferences, referenceLimit, referencesForSend, referenceTrigger } from '../shared/composer-references.mjs'
 import './style.css'
 
 const api = window.rainbow
@@ -40,8 +41,19 @@ const triggers = [
   { title: '试试分工协作', text: '用一个具体例子演示产品和研发会怎样分工。请各自说说你会负责哪部分。', icon: UsersRound },
 ]
 
-function Avatar({ role, size = '' }) {
-  if (!role) return <span className={'avatar avatar-user ' + size}><UserRound size={17} /></span>
+function UserAvatar({ user, size }) {
+  const [failed, setFailed] = useState('')
+  const src = user?.avatar === undefined && user?.avatarId
+    ? 'rainbow-content://profile/' + encodeURIComponent(user.avatarId)
+    : user?.avatar
+  const [initial] = user?.name?.trim() || ''
+  return <span className={'avatar avatar-user ' + size} aria-hidden="true">
+    {src && src !== failed ? <img src={src} alt="" onError={() => setFailed(src)} /> : initial || <UserRound size={17} />}
+  </span>
+}
+
+function Avatar({ role, user, size = '' }) {
+  if (!role) return <UserAvatar user={user} size={size} />
   return <span className={'avatar ' + role.type + ' ' + role.form + ' ' + size}><img src={art(role.type, role.form)} alt="" /></span>
 }
 
@@ -337,6 +349,66 @@ function DeleteNoteDialog({ thread, file, close }) {
   </Dialog>
 }
 
+function ProfileSettings({ profile }) {
+  const [name, setName] = useState(profile?.name || '')
+  const [avatar, setAvatar] = useState(undefined)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [saved, setSaved] = useState(false)
+  const hasAvatar = avatar === undefined ? Boolean(profile?.avatarId) : Boolean(avatar)
+  const dirty = name.trim() !== (profile?.name || '') || avatar !== undefined
+
+  function changeAvatar(image) {
+    setAvatar(image)
+    setSaved(false)
+    setError('')
+  }
+
+  async function pickAvatar() {
+    setBusy(true)
+    setError('')
+    try {
+      const image = await api.pickAvatar()
+      if (image) changeAvatar(image)
+    } catch (failure) { setError(errorText(failure)) } finally { setBusy(false) }
+  }
+
+  async function saveProfile(event) {
+    event.preventDefault()
+    if (!dirty || busy) return
+    setBusy(true)
+    setError('')
+    try {
+      await api.saveProfile({ name, avatar })
+      setName(name.trim())
+      setAvatar(undefined)
+      setSaved(true)
+    } catch (failure) { setError(errorText(failure)) } finally { setBusy(false) }
+  }
+
+  return <form className="profile-settings" onSubmit={saveProfile}>
+    <fieldset className="stack" disabled={busy}>
+      <legend>个人资料</legend>
+      <div className="profile-avatar-controls">
+        <Avatar user={{ name, avatarId: profile?.avatarId, avatar }} size="profile-preview" />
+        <button className="secondary-button" type="button" onClick={pickAvatar}>选择头像</button>
+        {hasAvatar && <button className="secondary-button" type="button"
+          onClick={() => changeAvatar(profile?.avatarId ? null : undefined)}>移除头像</button>}
+      </div>
+      <label>显示名<input value={name} maxLength={36} placeholder="你" onChange={event => {
+        setName(event.target.value)
+        setSaved(false)
+        setError('')
+      }} /></label>
+      {error && <div className="form-error" role="alert"><CircleAlert size={16} />{error}</div>}
+      <div className="profile-actions">
+        <span className="dialog-note" role="status">{saved && '已保存'}</span>
+        <button className="primary-button" type="submit" disabled={!dirty || busy}>保存个人资料</button>
+      </div>
+    </fieldset>
+  </form>
+}
+
 function SettingsDialog({ settings, runtimes, close }) {
   const [data, setData] = useState(settings)
   const { error, busy, save, setError } = useSave(close)
@@ -347,6 +419,7 @@ function SettingsDialog({ settings, runtimes, close }) {
     void api.run('appearanceSettings', { theme: event.currentTarget.value }).catch(failure => setError(errorText(failure)))
   }
   return <Dialog title="设置" close={close}>
+    <ProfileSettings profile={settings.profile} />
     <fieldset className="appearance-settings">
       <legend>主题</legend>
       <div className="theme-options">
@@ -533,19 +606,26 @@ function Hero({ thread, roles, onPrompt }) {
   </div>
 }
 
-function remarkMentions(roles) {
+function remarkMentions(roles, inline = []) {
   return () => root => {
     const visit = node => {
       if (!node.children) return
       node.children = node.children.flatMap(child => {
         if (child.type !== 'text') { visit(child); return [child] }
-        const mentions = findMentions(child.value, roles)
+        const offset = child.position?.start.offset
+        const spans = inline.map(span => ({ ...span, start: span.start - offset, end: span.end - offset }))
+          .filter(span => span.start >= 0 && span.end <= child.value.length && child.value[span.start] === span.symbol)
+        const mentions = [...findMentions(child.value, roles)
+          .filter(mention => !spans.some(span => mention.start < span.end && mention.end > span.start)), ...spans]
+          .sort((a, b) => a.start - b.start)
         if (!mentions.length) return [child]
         const output = []
         let cursor = 0
-        for (const { start, end } of mentions) {
+        for (const { start, end, kind, id } of mentions) {
           if (cursor < start) output.push({ type: 'text', value: child.value.slice(cursor, start) })
-          output.push({ type: 'mention', data: { hName: 'mark', hProperties: { className: ['mention-copy'] } },
+          const properties = { className: ['mention-copy'] }
+          if (kind === 'conversation') properties['data-conversation'] = id.slice('conversation:'.length)
+          output.push({ type: 'mention', data: { hName: 'mark', hProperties: properties },
             children: [{ type: 'text', value: child.value.slice(start, end).replace(/^@\{(.+)\}$/, '@$1') }] })
           cursor = end
         }
@@ -557,12 +637,12 @@ function remarkMentions(roles) {
   }
 }
 
-function QuoteContent({ message, roles }) {
-  const name = byId(roles, message.author?.id)?.name || message.author?.name || '你'
+function QuoteContent({ message, roles, user }) {
+  const name = message.author ? byId(roles, message.author.id)?.name || message.author.name : user?.name || '你'
   return <span className="quote-content"><strong>{name}</strong><span>{message.text.replace(/\s+/g, ' ').slice(0, 180)}</span></span>
 }
 
-function Message({ message, draft, thread, roles, onReply, onInvite, onView }) {
+function Message({ message, draft, thread, roles, user, onReply, onInvite, onView, onConversation }) {
   const [show, toggle] = useState(false)
   const { author, status } = message
   const working = status === 'running' || status === 'queued'
@@ -578,10 +658,11 @@ function Message({ message, draft, thread, roles, onReply, onInvite, onView }) {
   const task = author && canAct && associatedTaskId && byId(thread.tasks || [], associatedTaskId)
   const taskThread = task && thread.messages.some(run => run.taskId === task.id && run.author?.id === author.id) ? task : null
   const quoted = message.replyToId && byId(thread.messages, message.replyToId)
+  const attachedReferences = (message.references || []).filter(item => !message.inlineReferences?.some(span => span.id === item.id))
   return <article id={'message-' + message.id} className={'message ' + (author?.type || 'human') + (error ? ' message-error' : '')}>
-    <Avatar role={displayRole} />
+    <Avatar role={displayRole} user={user} />
     <div className="message-body">
-      <div className="message-meta"><strong>{displayRole?.name || '你'}</strong>
+      <div className="message-meta"><strong>{displayRole ? displayRole.name : user?.name || '你'}</strong>
         {currentRole ? <ModelBadge type={currentRole.type} model={currentModel?.id || '待选择模型'} name={currentModel?.label}
           effort={currentModel?.effort} runLabel={modelLabel(message.model, message.effort)} />
           : author && <ModelBadge type={author.type} model={message.model} name={message.modelName} effort={message.effort} />}
@@ -590,13 +671,13 @@ function Message({ message, draft, thread, roles, onReply, onInvite, onView }) {
       <div className="bubble">
         {quoted && <button type="button" className="message-quote" onClick={() => {
           document.getElementById('message-' + quoted.id)?.scrollIntoView({ block: 'center' })
-        }}><QuoteContent message={quoted} roles={roles} /></button>}
+        }}><QuoteContent message={quoted} roles={roles} user={user} /></button>}
         {working && !draft ? <span className="working"><span className="typing"><i /><i /><i /></span>{status === 'queued' ? '等待接话' : '正在回复'}</span>
           : error ? <span className="message-failure"><CircleAlert size={16} />{message.error}</span>
           : <ContentMarkdown text={message.text || draft || ''} artifacts={message.artifacts} threadId={thread.id} messageId={message.id}
-            mentionPlugin={remarkMentions(roles)} onView={onView} />}
+            mentionPlugin={remarkMentions(roles, message.inlineReferences)} onView={onView} onConversation={onConversation} />}
         <GeneratedMedia threadId={thread.id} messageId={message.id} artifacts={message.artifacts || []} onView={onView} />
-        {message.references?.length > 0 && <ReferenceList items={message.references} />}
+        {attachedReferences.length > 0 && <ReferenceList items={attachedReferences} />}
       </div>
       {canAct && <div className="message-actions" role="group" aria-label="消息操作">
         <IconButton icon={Reply} label="回复此消息" onClick={onReply} />
@@ -657,22 +738,46 @@ function ComposerReferenceCard({ threadId, item, remove }) {
   </li>
 }
 
-function ReferencePicker({ threadId, typedQuery, onChoose, onPath, onClose }) {
-  const [kind, setKind] = useState(() => typedQuery === null ? null : 'skill')
-  const [query, setQuery] = useState('')
-  const [catalogs, setCatalogs] = useState({})
+const referenceOptions = [
+  { id: 'choose-file', kind: 'file', pick: true, name: '选择文件…' },
+  { id: 'choose-directory', kind: 'directory', pick: true, name: '选择目录…' },
+]
+
+function composerReferenceGroups(mode, query, roles, threads, activeThread, workspace, catalogs) {
+  const term = query.trim().toLocaleLowerCase()
+  const matches = (...fields) => !term || fields.some(field => field?.toLocaleLowerCase().includes(term))
+  const skills = catalogs.skill?.items || []
+  const plugins = catalogs.plugin?.items || []
+  const toolsOnly = mode === '$' || mode === '/'
+  const ownership = toolsOnly ? new Map(plugins.map(item => [item.runtime + ':' + item.key, item])) : new Map()
+  const owningPlugin = item => ownership.get(item.runtime + ':' + item.pluginKey)
+  const matchesTool = item => matches(item.name, item.skillName, item.description, item.key)
+  const standalone = skills.filter(item => !owningPlugin(item) && matchesTool(item))
+  const pluginItems = plugins.flatMap(plugin => {
+    const ownMatch = matchesTool(plugin)
+    if (!toolsOnly) return ownMatch ? [plugin] : []
+    const children = skills.filter(skill => owningPlugin(skill) === plugin && (ownMatch || matchesTool(skill)))
+    return [...(ownMatch ? [plugin] : []), ...children.map(skill => ({ ...skill, pluginName: plugin.name }))]
+  })
+  const toolGroups = [{ label: 'Skill', items: standalone }, { label: 'Plugin', items: pluginItems }]
+  if (toolsOnly) return toolGroups
+  const workspaceSearch = mode === '@' ? term.split('/').at(-1) : null
+  const files = workspaceSearch === null ? [] : (workspace || []).filter(item => item.name.toLocaleLowerCase().includes(workspaceSearch))
+    .slice(0, 20).map(item => ({
+      id: 'workspace:' + item.path, kind: item.directory ? 'directory' : 'file', name: item.name, path: item.path, workspace: true,
+    }))
+  const paths = { label: '文件和目录', items: [
+    ...files, ...referenceOptions.filter(item => matches(item.name, item.kind, item.kind === 'directory' ? '文件夹' : '文件')),
+  ] }
+  if (mode !== '@') return [paths, ...toolGroups]
+  const members = roles.filter(role => matches(role.name, role.label)).map(role => ({ ...role, kind: 'member' }))
+  const conversations = threads.filter(thread => thread.id !== activeThread && matches(thread.name))
+    .sort(byActivity).map(thread => ({ id: 'conversation:' + thread.id, name: thread.name, description: thread.description, kind: 'conversation' }))
+  return [{ label: '成员', items: members }, { label: '其他会话', items: conversations }, ...toolGroups, paths]
+}
+
+function ReferencePicker({ groups, active, id, query, onQuery, onChoose, onClose, onKeyDown, catalogs }) {
   const element = useRef(null)
-  const catalog = catalogs[kind]
-  useEffect(() => {
-    if (!kind || catalog) return
-    let live = true
-    api.referenceList(threadId, kind).then(items => {
-      if (live) setCatalogs(previous => ({ ...previous, [kind]: { items } }))
-    }).catch(error => {
-      if (live) setCatalogs(previous => ({ ...previous, [kind]: { error: errorText(error) } }))
-    })
-    return () => { live = false }
-  }, [threadId, kind, catalog])
   useEffect(() => {
     const closeOutside = event => {
       if (!element.current?.contains(event.target) && !event.target.closest('.composer textarea, .reference-toggle')) onClose()
@@ -680,50 +785,94 @@ function ReferencePicker({ threadId, typedQuery, onChoose, onPath, onClose }) {
     document.addEventListener('pointerdown', closeOutside)
     return () => document.removeEventListener('pointerdown', closeOutside)
   }, [onClose])
-  const match = (typedQuery ?? query).trim().toLocaleLowerCase()
-  const items = (catalog?.items || []).filter(item => [item.name, item.description, item.key].some(value => value?.toLocaleLowerCase().includes(match))).slice(0, 60)
-  return <div className="pop-menu reference-picker" ref={element} aria-label="插入引用" onKeyDown={event => {
-    if (event.key === 'Escape') { event.preventDefault(); onClose() }
-  }}>
-    <div className="reference-picker-tabs">
-      <button type="button" onClick={() => onPath('file')}><FileText size={14} />文件…</button>
-      <button type="button" onClick={() => onPath('directory')}><Folder size={14} />目录…</button>
-      <button type="button" aria-pressed={kind === 'skill'} onClick={() => setKind('skill')}><BookOpen size={14} />Skill</button>
-      <button type="button" aria-pressed={kind === 'plugin'} onClick={() => setKind('plugin')}><Puzzle size={14} />Plugin</button>
+  useEffect(() => {
+    element.current?.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest' })
+  }, [active])
+  const loading = !catalogs.skill || !catalogs.plugin
+  const error = catalogs.skill?.error || catalogs.plugin?.error
+  const empty = groups.every(group => group.items.length === 0)
+  return <div className="pop-menu reference-picker" ref={element} aria-label="插入引用">
+    {onQuery && <input aria-label="搜索引用" placeholder="搜索引用" value={query}
+      onChange={event => onQuery(event.target.value)} onKeyDown={event => {
+        if (!onKeyDown(event) && event.key === 'Enter') event.preventDefault()
+      }} />}
+    <div className="reference-results" id={id} role="listbox" aria-label="可选引用">
+      {groups.filter(group => group.items.length).map(({ label, items }) => <div key={label} role="group" aria-label={label} className="reference-group">
+        <span aria-hidden="true" className="reference-group-heading">{label}</span>
+        {items.map(item => {
+          const Icon = referenceIcons[item.kind] || (item.kind === 'conversation' ? MessageSquare : fileIcon(item.path || item.name))
+          const detail = item.pluginName || item.description
+          return <button type="button" role="option" tabIndex={-1} key={item.id} id={id + '-' + item.id}
+            aria-selected={item.id === active} className={item.pluginName ? 'plugin-skill-option' : undefined}
+            title={item.path || item.key || detail} onMouseDown={event => event.preventDefault()} onClick={() => onChoose(item)}>
+            {item.kind === 'member' ? <Avatar role={item} size="tiny" /> : <Icon size={15} aria-hidden="true" />}
+            <span className="reference-result-name"><strong>{item.name}</strong>{detail && <small>{detail}</small>}</span>
+            {item.kind === 'member' ? <RoleModelBadge role={item} /> : item.runtime && <span className="reference-runtime">{runtimeLabel[item.runtime]}</span>}
+          </button>
+        })}
+      </div>)}
     </div>
-    {kind && typedQuery === null && <input aria-label="搜索引用" placeholder="搜索引用" value={query} onChange={event => setQuery(event.target.value)}
-      onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); if (items.length) onChoose(items[0]) } }} />}
-    <div className="reference-results">
-      {kind && !catalog && <div role="status" className="reference-picker-note">正在读取引用…</div>}
-      {catalog?.error && <div role="alert" className="reference-picker-note">{catalog.error}</div>}
-      {catalog?.items && !items.length && <div className="reference-picker-note">没有匹配的引用</div>}
-      {items.map(item => <button type="button" key={item.id} title={item.path || item.key} onClick={() => onChoose(item)}>
-        <span className="reference-result-name"><strong>{item.name}</strong>{item.description && <small>{item.description}</small>}</span>
-        <span className="reference-runtime">{runtimeLabel[item.runtime]}</span>
-      </button>)}
-    </div>
+    {loading && <div role="status" className="reference-picker-note">正在读取 Skill 和 Plugin…</div>}
+    {error && <div role="status" className="reference-picker-note">{error}</div>}
+    {!loading && !error && empty && <div className="reference-picker-note">没有匹配的引用</div>}
   </div>
 }
 
-function Composer({ thread, roles, fill, error, command, task, clearTask, quote, clearQuote, attachment, onAttachmentHandled }) {
+function Composer({ thread, roles, threads, user, fill, error, command, task, clearTask, quote, clearQuote, attachment, onAttachmentHandled }) {
   const [text, setText] = useState('')
   const [caret, setCaret] = useState(0)
-  const [hideMentions, setHideMentions] = useState(false)
+  const [dismissed, setDismissed] = useState(null)
+  const [inlineReferences, setInlineReferences] = useState([])
   const [sending, setSending] = useState(false)
   const [references, setReferences] = useState([])
   const attached = useRef([])
   const [referenceMenu, setReferenceMenu] = useState(false)
   const [referenceError, setReferenceError] = useState('')
   const ref = useRef()
-  const prefix = text.slice(0, caret)
-  const mention = /(?:^|\s)@([^@\n]*)$/u.exec(prefix)
-  const skill = /(?:^|\s)\$([^\s$@]*)$/u.exec(prefix)
-  const typedReference = !referenceMenu && !hideMentions && skill ? skill[1] : null
-  const pickerOpen = referenceMenu || typedReference !== null
-  const candidates = mention && !hideMentions ? roles.filter(role => role.name.toLowerCase().includes(mention[1].toLowerCase())) : []
+  const [catalogs, setCatalogs] = useState({})
+  const catalogRequests = useRef(null)
+  const [workspace, setWorkspace] = useState(null)
+  const [manualQuery, setManualQuery] = useState('')
+  const [selectedId, setSelectedId] = useState('')
+  const listId = useId()
+  const candidate = referenceTrigger(text, caret)
+  const trigger = candidate && !(dismissed?.start === candidate.start && dismissed.symbol === candidate.symbol)
+    && !inlineReferences.some(span => span.start <= candidate.start && candidate.start < span.end) ? candidate : null
+  const mode = referenceMenu ? 'manual' : trigger?.symbol
+  const query = referenceMenu ? manualQuery : trigger?.query || ''
+  const workspaceDirectory = mode === '@' && query.includes('/') ? query.trim().slice(0, query.trim().lastIndexOf('/')) : ''
+  const groups = mode ? composerReferenceGroups(mode, query, roles, threads, thread.id,
+    workspace?.path === workspaceDirectory ? workspace.entries : [], catalogs) : []
+  const options = groups.flatMap(group => group.items)
+  const selected = options.find(item => item.id === selectedId) || options[0]
+  const pickerOpen = Boolean(mode)
+  const catalogScope = thread.cwd + '|' + thread.roleIds.join(',')
+  useEffect(() => {
+    if (!pickerOpen) return
+    let live = true
+    const kinds = ['skill', 'plugin']
+    if (catalogRequests.current?.scope !== catalogScope || Date.now() - catalogRequests.current.startedAt > 30_000) {
+      catalogRequests.current = { scope: catalogScope, startedAt: Date.now(), requests: Object.fromEntries(kinds.map(kind => [
+        kind, api.referenceList(thread.id, kind).then(items => ({ items })).catch(failure => ({ error: errorText(failure) })),
+      ])) }
+      setCatalogs({})
+    }
+    for (const kind of kinds) void catalogRequests.current.requests[kind].then(result => {
+      if (live) setCatalogs(previous => ({ ...previous, [kind]: result }))
+    })
+    return () => { live = false }
+  }, [pickerOpen, thread.id, catalogScope])
+  useEffect(() => {
+    if (mode !== '@') return
+    let live = true
+    api.workspaceEntries(thread.id, workspaceDirectory).then(({ entries }) => {
+      if (live) setWorkspace({ path: workspaceDirectory, entries })
+    }).catch(() => { if (live) setWorkspace({ path: workspaceDirectory, entries: [] }) })
+    return () => { live = false }
+  }, [mode, thread.id, thread.cwd, workspaceDirectory])
   const fillText = fill?.text
   useEffect(() => {
-    if (fillText) { setText(fillText); setCaret(fillText.length); ref.current?.focus() }
+    if (fillText) { setText(fillText); setInlineReferences([]); setDismissed(null); setCaret(fillText.length); ref.current?.focus() }
   }, [fill])
   useEffect(() => { if (task?.id) ref.current?.focus() }, [task?.id])
   useEffect(() => { if (quote?.id) ref.current?.focus() }, [quote?.id])
@@ -733,43 +882,103 @@ function Composer({ thread, roles, fill, error, command, task, clearTask, quote,
     editor.style.height = Math.max(42, Math.min(editor.scrollHeight, 142)) + 'px'
   }, [text])
 
-  function insertMention(role) {
-    const plain = prefix.slice(0, prefix.lastIndexOf('@')) + '@' + role.name + ' '
-    const next = plain + text.slice(caret)
-    setText(next)
-    setCaret(plain.length)
-    setHideMentions(true)
-    requestAnimationFrame(() => { ref.current.focus(); ref.current.setSelectionRange(plain.length, plain.length) })
+  function closeReferences() {
+    setReferenceMenu(false)
+    setSelectedId('')
+    if (candidate) setDismissed({ start: candidate.start, symbol: candidate.symbol })
   }
 
-  function closeReferences() { setReferenceMenu(false); setHideMentions(true) }
+  function updateDraft(next, position) {
+    setInlineReferences(spans => rebaseReferences(text, next, spans))
+    if (dismissed && text.slice(0, dismissed.start + 1) !== next.slice(0, dismissed.start + 1)) setDismissed(null)
+    setSelectedId('')
+    setText(next)
+    setCaret(position)
+  }
+
+  function replaceDraft(value, range, item, symbol) {
+    const editor = ref.current
+    if (!editor) return
+    const current = editor.value
+    if (range && current.slice(range.start, range.end) !== range.symbol + range.query) range = null
+    const start = range?.start ?? editor.selectionStart
+    const end = range?.end ?? editor.selectionEnd
+    const before = current.slice(0, start)
+    const padding = value && before && !/\s$/u.test(before) && !range ? ' ' : ''
+    const next = before + padding + value + current.slice(end)
+    if (next.length > editor.maxLength) return
+    const position = start + padding.length + value.length
+    setInlineReferences(spans => {
+      const updated = rebaseReferences(current, next, spans)
+      return item ? [...updated, { kind: item.kind, id: item.id, symbol, start: start + padding.length, end: position - 1 }]
+        .sort((a, b) => a.start - b.start) : updated
+    })
+    setText(next)
+    setCaret(position)
+    closeReferences()
+    requestAnimationFrame(() => { ref.current?.focus(); ref.current?.setSelectionRange(position, position) })
+  }
 
   function setAttached(items) {
     attached.current = items
     setReferences(items)
   }
 
-  function attach(items, trigger) {
+  function attach(items, range) {
     if (!items.length) return
     const combined = [...new Map([...attached.current, ...items].map(item => [item.id, item])).values()]
-    if (combined.length > 8) { setReferenceError('每条消息最多引用 8 项。'); return }
+    if (new Set([...combined.map(item => item.id), ...inlineReferences.map(item => item.id)]).size > referenceLimit) {
+      setReferenceError('每条消息最多引用 8 项。')
+      return
+    }
     setAttached(combined)
     setReferenceError('')
-    closeReferences()
-    const start = trigger ? prefix.lastIndexOf(trigger) : null
-    if (start !== null && start >= 0) {
-      setText(text.slice(0, start) + text.slice(caret))
-      setCaret(start)
-    }
-    requestAnimationFrame(() => {
-      ref.current?.focus()
-      if (start !== null && start >= 0) ref.current?.setSelectionRange(start, start)
-    })
+    if (range) replaceDraft('', range)
+    else { closeReferences(); requestAnimationFrame(() => ref.current?.focus()) }
   }
 
-  async function pickPaths(kind, trigger) {
-    try { attach(await api.referenceFiles(thread.id, kind), trigger) }
-    catch (failure) { setReferenceError(errorText(failure)) }
+  async function chooseReference(item) {
+    const range = trigger
+    try {
+      if (item.pick) { attach(await api.referenceFiles(thread.id, item.kind), range); return }
+      if (item.workspace) { attach(await api.workspaceReference(thread.id, item.path), range); return }
+      if (item.kind === 'member') {
+        replaceDraft('@' + item.name + ' ', range)
+        return
+      }
+      if (new Set([...attached.current.map(ref => ref.id), ...inlineReferences.map(ref => ref.id), item.id]).size > referenceLimit
+        || inlineReferences.length >= referenceLimit) {
+        setReferenceError('每条消息最多引用 8 项。')
+        return
+      }
+      const symbol = item.kind === 'conversation' ? '@' : range?.symbol || '$'
+      setReferenceError('')
+      replaceDraft(symbol + inlineReferenceName(item.name) + ' ', range, item, symbol)
+    } catch (failure) {
+      setReferenceError(errorText(failure))
+    }
+  }
+
+  function onPickerKeyDown(event) {
+    if (!pickerOpen || event.nativeEvent.isComposing || event.keyCode === 229) return false
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      closeReferences()
+      return true
+    }
+    if (selected && ['ArrowUp', 'ArrowDown'].includes(event.key)) {
+      event.preventDefault()
+      const from = options.indexOf(selected)
+      const next = (from + (event.key === 'ArrowDown' ? 1 : -1) + options.length) % options.length
+      setSelectedId(options[next].id)
+      return true
+    }
+    if (selected && event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault()
+      void chooseReference(selected)
+      return true
+    }
+    return false
   }
 
   async function attachFiles({ path, paths }) {
@@ -800,11 +1009,13 @@ function Composer({ thread, roles, fill, error, command, task, clearTask, quote,
     if (sending || !text.trim()) return
     setSending(true)
     try {
-      if (await command('send', { threadId: thread.id, taskId: task?.id, replyToId: quote?.id, text,
+      const draft = referencesForSend(text, inlineReferences)
+      if (await command('send', { threadId: thread.id, taskId: task?.id, replyToId: quote?.id, ...draft,
         ...(references.length ? { referenceIds: references.map(item => item.id) } : {}) })) {
         setText('')
         setCaret(0)
-        setHideMentions(false)
+        setDismissed(null)
+        setInlineReferences([])
         setAttached([])
         setReferenceMenu(false)
         setReferenceError('')
@@ -817,7 +1028,7 @@ function Composer({ thread, roles, fill, error, command, task, clearTask, quote,
     {(error || referenceError) && <div role="alert" className="composer-error"><CircleAlert size={15} />{error || referenceError}</div>}
     <form className="composer" onSubmit={send}>
       {task && <div className="composer-task"><span>追问「{task.title}」</span><IconButton icon={X} label="退出任务追问" onClick={clearTask} /></div>}
-      {quote && <div className="composer-quote"><QuoteContent message={quote} roles={roles} />
+      {quote && <div className="composer-quote"><QuoteContent message={quote} roles={roles} user={user} />
         <IconButton icon={X} label="取消引用" onClick={() => clearQuote(quote.id)} /></div>}
       {references.length > 0 && <ul className="composer-attachments" aria-label="待发送引用">
         {references.map(item => <ComposerReferenceCard key={item.id} threadId={thread.id} item={item} remove={id => {
@@ -825,45 +1036,46 @@ function Composer({ thread, roles, fill, error, command, task, clearTask, quote,
           setReferenceError('')
         }} />)}
       </ul>}
-      {pickerOpen && <ReferencePicker threadId={thread.id} typedQuery={typedReference}
-        onClose={closeReferences} onChoose={item => attach([item], typedReference !== null ? '$' : undefined)}
-        onPath={kind => pickPaths(kind, typedReference !== null ? '$' : undefined)} />}
-      {mention && !hideMentions && !pickerOpen && <div className="pop-menu mentions-menu"><span>引用</span>{candidates.map(role =>
-        <button key={role.id} type="button" onMouseDown={event => event.preventDefault()} onClick={() => insertMention(role)}>
-          <Avatar role={role} size="tiny" />{role.name}
-          <RoleModelBadge role={role} />
-        </button>)}
-        <button type="button" onMouseDown={event => event.preventDefault()} onClick={() => pickPaths('file', '@')}><FileText size={15} />选择文件…</button>
-        <button type="button" onMouseDown={event => event.preventDefault()} onClick={() => pickPaths('directory', '@')}><Folder size={15} />选择目录…</button>
-      </div>}
+      {pickerOpen && <ReferencePicker groups={groups} id={listId} active={selected?.id} catalogs={catalogs} query={manualQuery}
+        onQuery={referenceMenu ? value => { setManualQuery(value); setSelectedId('') } : undefined}
+        onClose={closeReferences} onChoose={chooseReference} onKeyDown={onPickerKeyDown} />}
       <textarea aria-label="消息" ref={ref} rows={1} maxLength={24000} value={text}
-        placeholder={task && !task.roleId ? '用 @ 指定接手成员，再补充要求…' : '说点什么，或用 @、$ 插入引用…'}
-        onChange={event => { setText(event.target.value); setCaret(event.target.selectionStart); setHideMentions(false) }}
+        placeholder={task && !task.roleId ? '用 @ 指定接手成员，再补充要求…' : '说点什么，或用 @、$、/ 插入引用…'}
+        aria-expanded={pickerOpen} aria-controls={pickerOpen ? listId : undefined}
+        aria-activedescendant={selected ? listId + '-' + selected.id : undefined}
+        onChange={event => updateDraft(event.target.value, event.target.selectionStart)}
         onSelect={event => setCaret(event.target.selectionStart)} onPaste={pasteFiles}
         onKeyDown={event => {
-          if (event.key === 'Escape') closeReferences()
+          if (onPickerKeyDown(event)) return
           if (event.key.toLowerCase() === 'v' && (event.metaKey || event.ctrlKey) && !event.altKey) {
             const paths = api.clipboardFiles()
             if (paths?.length) { event.preventDefault(); void attachFiles({ paths }); return }
           }
           if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) {
             event.preventDefault()
-            if (candidates.length === 1) insertMention(candidates[0])
-            else if (!candidates.length) void send()
+            if (!referenceMenu) void send()
           }
         }} />
       <div className="composer-tools">
         <div className="targets">
-          <IconButton icon={Paperclip} className="reference-toggle" label="插入引用" aria-expanded={pickerOpen} onClick={() => {
-            setReferenceMenu(!referenceMenu)
-            setHideMentions(true)
+          <IconButton icon={Paperclip} className="reference-toggle" label="插入引用" aria-expanded={referenceMenu} onClick={() => {
+            if (referenceMenu) { closeReferences(); return }
+            closeReferences()
+            setManualQuery('')
+            setReferenceMenu(true)
+            ref.current?.focus()
           }} />
-          <IconButton icon={AtSign} label="点名成员" disabled={!roles.length} onClick={() => {
-            const next = text.slice(0, caret) + (caret && !/\s$/.test(prefix) ? ' @' : '@')
-            setHideMentions(false)
-            setText(next + text.slice(caret))
-            setCaret(next.length)
-            requestAnimationFrame(() => { ref.current.focus(); ref.current.setSelectionRange(next.length, next.length) })
+          <IconButton icon={AtSign} label="插入 @ 引用" onClick={() => {
+            const editor = ref.current
+            const start = editor.selectionStart
+            const before = text.slice(0, start)
+            const prefix = before && !/\s$/u.test(before) ? ' @' : '@'
+            const next = before + prefix + text.slice(editor.selectionEnd)
+            const position = start + prefix.length
+            updateDraft(next, position)
+            setDismissed(null)
+            setReferenceMenu(false)
+            requestAnimationFrame(() => { ref.current?.focus(); ref.current?.setSelectionRange(position, position) })
           }} />
         </div>
         <div className="targets">
@@ -952,10 +1164,11 @@ function Chat({ state, thread, command, drafts, error, membersOpen, contentOpen,
   useEffect(() => { if (taskId) setReplyToId(null) }, [taskId])
   const messages = thread.messages.filter(message => !message.taskId || message.status === 'done' || !message.author)
   const roles = thread.roleIds.map(id => byId(state.roles, id)).filter(Boolean)
+  const user = state.settings.profile
   const HeadingIcon = roomIcons[thread.kind]
   const parent = byId(state.threads, thread.parentId)
-  const anchorAuthor = parent?.messages.find(message => message.id === thread.anchorMessageId)?.author?.id
-  const anchorName = byId(state.roles, anchorAuthor)?.name || thread.anchor?.name
+  const anchor = parent?.messages.find(message => message.id === thread.anchorMessageId)
+  const anchorName = anchor && !anchor.author ? user?.name || '你' : byId(state.roles, anchor?.author?.id)?.name || thread.anchor?.name
   const moveToBottom = () => {
     if (!list.current) return
     list.current.scrollTop = list.current.scrollHeight
@@ -1002,13 +1215,14 @@ function Chat({ state, thread, command, drafts, error, membersOpen, contentOpen,
       {thread.anchor && <div className="thread-anchor"><Reply size={17} /><div><strong>{anchorName}</strong><p>{thread.anchor.text}</p></div></div>}
       {messages.length === 0 && <Hero thread={thread} roles={roles} onPrompt={text => setFill({ text })} />}
       {messages.length > 0 && <section className="message-list" aria-label="会话记录">
-        {messages.map(message => <Message key={message.id} message={message} draft={drafts[message.id]} thread={thread} roles={state.roles} onView={onView}
+        {messages.map(message => <Message key={message.id} message={message} draft={drafts[message.id]} thread={thread} roles={state.roles} user={user} onView={onView}
+          onConversation={id => command('select', { threadId: id })}
           onReply={() => { onTask(null); setReplyToId(message.id) }}
           onInvite={roleId => command('inviteReply', { threadId: thread.id, messageId: message.id, roleId })} />)}
       </section>}
     </div>
     {!atBottom && <button type="button" className="jump-latest" onClick={moveToBottom}><ArrowDown size={15} />回到最新</button>}
-    <Composer thread={thread} roles={roles} fill={fill} error={error} command={command} attachment={attachment} onAttachmentHandled={onAttachmentHandled}
+    <Composer thread={thread} roles={roles} threads={state.threads} user={user} fill={fill} error={error} command={command} attachment={attachment} onAttachmentHandled={onAttachmentHandled}
       task={byId(thread.tasks || [], taskId)} clearTask={() => onTask(null)}
       quote={byId(thread.messages, replyToId)} clearQuote={id => setReplyToId(current => current === id ? null : current)} />
   </main>

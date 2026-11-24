@@ -7,6 +7,7 @@ import { readRuntimeCatalog } from './models.mjs'
 import { Notes, noteInstructions, parseNoteReply, visibleDraft } from './notes.mjs'
 import { chatActionInstructions, parseChatAction, visibleChatDraft } from './chat-action.mjs'
 import { directedMembers, findMentions } from '../shared/mentions.mjs'
+import { inlineReferenceKinds, matchesInlineReference, referenceLimit } from '../shared/composer-references.mjs'
 import { DEFAULT_THREAD_GROUP } from '../shared/thread-groups.mjs'
 import { referenceContext, runtimeReferences } from './references.mjs'
 
@@ -158,6 +159,15 @@ function transcript(thread, job, roles, cursor, excluded) {
     lines.unshift(line)
   }
   return lines.join('\n')
+}
+
+function referencedConversation(state, fromId, id) {
+  if (!id.startsWith('conversation:')) return null
+  const thread = state.threads.find(item => item.id === id.slice('conversation:'.length) && item.id !== fromId)
+  if (!thread) return null
+  const excerpt = thread.messages.filter(message => message.text && (!message.author || message.status === 'done')).slice(-4)
+    .map(message => JSON.stringify({ author: message.author?.name || '用户', text: message.text.slice(0, 700) })).join('\n')
+  return { id, kind: 'conversation', name: thread.name, targetThreadId: thread.id, description: thread.description?.slice(0, 500), excerpt }
 }
 
 function previousMemberWork(thread, job, taskId, excludedIds) {
@@ -593,18 +603,41 @@ export class Conversations {
     })
   }
 
-  send({ threadId, text, targetIds, taskId, replyToId, referenceIds }) {
+  send({ threadId, text, targetIds, taskId, replyToId, referenceIds, inlineReferences = [] }) {
     const state = this.store.value
     const thread = getThread(state, threadId)
     const messageText = required(text, MESSAGE_LIMIT, '消息')
     const roles = thread.roleIds.map(id => getRole(state, id))
-    const direct = directedMembers(messageText, roles)
     const user = { id: randomUUID(), text: messageText, at: Date.now() }
-    if (referenceIds !== undefined) {
-      if (!this.references) throw new Error('引用不可用。')
-      const references = this.references.resolve(threadId, referenceIds)
-      if (references.length) user.references = references
+    if (!Array.isArray(inlineReferences) || inlineReferences.length > referenceLimit
+      || referenceIds !== undefined && !Array.isArray(referenceIds)) throw new Error('引用格式无效。')
+    let previousEnd = 0
+    for (const span of inlineReferences) {
+      if (!span || typeof span.id !== 'string' || !inlineReferenceKinds.includes(span.kind)
+        || !Number.isInteger(span.start) || !Number.isInteger(span.end)
+        || span.start < previousEnd || span.start >= span.end || span.end > messageText.length) throw new Error('正文中的引用已失效。')
+      previousEnd = span.end
     }
+    const selectedIds = [...new Set([...(referenceIds || []), ...inlineReferences.map(span => span.id)])]
+    if (selectedIds.length > referenceLimit) throw new Error('每条消息最多引用 8 项。')
+    const catalogIds = selectedIds.filter(id => typeof id !== 'string' || !id.startsWith('conversation:'))
+    if (catalogIds.length && !this.references) throw new Error('引用不可用。')
+    const selected = new Map((this.references?.resolve(threadId, catalogIds) || []).map(item => [item.id, item]))
+    for (const id of selectedIds) {
+      if (typeof id !== 'string' || !id.startsWith('conversation:')) continue
+      if (!inlineReferences.some(span => span.id === id && span.kind === 'conversation')) throw new Error('请选择正文中的会话引用。')
+      const conversation = referencedConversation(state, threadId, id)
+      if (!conversation) throw new Error('引用的会话已不存在。')
+      selected.set(id, conversation)
+    }
+    let routingText = messageText
+    for (const span of [...inlineReferences].reverse()) {
+      if (!matchesInlineReference(messageText, span, selected.get(span.id))) throw new Error('正文中的引用已失效。')
+      routingText = routingText.slice(0, span.start) + ' '.repeat(span.end - span.start) + routingText.slice(span.end)
+    }
+    const direct = directedMembers(routingText, roles)
+    if (selected.size) user.references = selectedIds.map(id => selected.get(id))
+    if (inlineReferences.length) user.inlineReferences = inlineReferences.map(({ id, kind, symbol, start, end }) => ({ id, kind, symbol, start, end }))
     if (replyToId) {
       const quoted = thread.messages.find(item => item.id === replyToId && item.text && (!item.author || item.status === 'done'))
       if (!quoted) throw new Error('引用的消息已不可用，请重新选择。')
@@ -876,7 +909,8 @@ export class Conversations {
       try {
         result = await execute(canResume ? session : undefined)
       } catch (error) {
-        if (!canResume || error.code !== 'RDS_SESSION_MISSING' || controller.signal.aborted) throw error
+        const canRebuild = error.code === 'RDS_SESSION_MISSING' || error.code === 'RDS_SESSION_BUSY'
+        if (!canResume || !canRebuild || controller.signal.aborted) throw error
         result = await execute()
       }
     } catch (error) { failure = error } finally { grant?.close(); this.liveActivity.delete(job.messageId) }

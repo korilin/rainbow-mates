@@ -68,8 +68,8 @@ export async function readCodexSkills(binary, cwd) {
     follow: { method: 'skills/list', params: { cwds: [cwd] } },
   })
   return result.data.flatMap(entry => entry.skills.filter(skill => skill.enabled).map(skill => ({
-    kind: 'skill', runtime: 'codex', name: skill.name, path: skill.path,
-    description: skill.shortDescription || skill.description, key: skill.path,
+    kind: 'skill', runtime: 'codex', name: skill.interface?.displayName || skill.name, skillName: skill.name, path: skill.path,
+    description: skill.interface?.shortDescription || skill.shortDescription || skill.description, key: skill.path, pluginKey: skill.pluginId || undefined,
   })))
 }
 

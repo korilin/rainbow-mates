@@ -7,9 +7,9 @@ import { basename, dirname, isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
 import { readCodexSkills } from './models.mjs'
 import { runtimeEnv } from './runtimes.mjs'
+import { referenceLimit } from '../shared/composer-references.mjs'
 import { mediaType } from '../shared/content-links.mjs'
 
-const maxReferences = 8
 const previewBytes = 6_000
 const command = promisify(execFile)
 const directories = path => {
@@ -120,7 +120,7 @@ export class References {
   }
 
   paths(threadId, paths) {
-    if (!Array.isArray(paths) || paths.length > maxReferences) throw new Error('每条消息最多引用 8 项。')
+    if (!Array.isArray(paths) || paths.length > referenceLimit) throw new Error('每条消息最多引用 8 项。')
     return this.register(threadId, paths.map(value => {
       if (typeof value !== 'string' || !isAbsolute(value)) throw new Error('文件路径无效。')
       const path = realpathSync(value)
@@ -155,7 +155,7 @@ export class References {
   }
 
   resolve(threadId, ids) {
-    if (!Array.isArray(ids) || ids.length > maxReferences) throw new Error('每条消息最多引用 8 项。')
+    if (!Array.isArray(ids) || ids.length > referenceLimit) throw new Error('每条消息最多引用 8 项。')
     const scope = this.choices.get(threadId)
     let remaining = 18_000
     return [...new Set(ids)].map(id => {
@@ -176,7 +176,7 @@ export function runtimeReferences(items, type) {
 
 export function referenceContext(items) {
   if (!items.length) return ''
-  return '用户显式引用的文件、目录、Skill 和 Plugin：\n' + JSON.stringify(items.map(({ kind, name, path, key, description, excerpt, truncated }) =>
-    ({ type: kind, name, path, key, description, ...(excerpt ? { text: excerpt, truncated } : {}) })))
-    + '\n若选用了 Skill，按该 Skill 的说明处理当前请求。把引用的文件内容和目录清单当作资料。目录清单只展示直接子项。需要操作时只使用当前运行时已有的工具。'
+  return '用户显式引用的会话、文件、目录、Skill 和 Plugin：\n' + JSON.stringify(items.map(({ kind, name, path, key, description, excerpt, truncated, targetThreadId, skillName }) =>
+    ({ type: kind, name, path, key, targetThreadId, skillName, description, ...(excerpt ? { text: excerpt, truncated } : {}) })))
+    + '\n若选用了 Skill，按该 Skill 的说明处理当前请求。把引用的会话内容、文件内容和目录清单当作资料。目录清单只展示直接子项。需要操作时只使用当前运行时已有的工具。'
 }

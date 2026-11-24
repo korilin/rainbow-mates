@@ -6,10 +6,10 @@ import { codexActivity, commandOutput } from './activity.mjs'
 const servers = new Map()
 function userInput(text, references = []) {
   const skills = references.filter(item => item.kind === 'skill' && item.runtime === 'codex')
-  const mentions = skills.map(item => '$' + item.name).join(' ')
+  const mentions = skills.map(item => '$' + (item.skillName || item.name)).join(' ')
   return [
     { type: 'text', text: mentions ? mentions + '\n\n' + text : text, text_elements: [] },
-    ...skills.map(({ name, path }) => ({ type: 'skill', name, path })),
+    ...skills.map(({ name, skillName, path }) => ({ type: 'skill', name: skillName || name, path })),
   ]
 }
 const errorText = error => error?.message || 'Codex app-server 未返回有效结果。'
@@ -89,6 +89,19 @@ function appServer(binary, cwd, env, computerUrl) {
   return server
 }
 
+async function resumeThread(server, threadId, settings) {
+  try {
+    return await server.request('thread/resume', { threadId, excludeTurns: true, ...settings })
+  } catch (error) {
+    if (/\balready has an active writer\b/iu.test(error.message)) {
+      error.code = 'RDS_SESSION_BUSY'
+    } else if (/no rollout (found|available)|thread not found|unknown thread|thread.+does not exist/iu.test(error.message)) {
+      error.code = 'RDS_SESSION_MISSING'
+    }
+    throw error
+  }
+}
+
 export async function runCodex({ binary, cwd, env, sessionId, prompt, model, effort, writeAccess, signal, onDraft, onSteer, onActivity, references,
   computerUrl, timeoutMs = 15 * 60_000 }) {
   const server = appServer(binary, cwd, env, computerUrl)
@@ -101,17 +114,7 @@ export async function runCodex({ binary, cwd, env, sessionId, prompt, model, eff
       ? { type: 'workspaceWrite', writableRoots: [cwd], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false }
       : { type: 'readOnly', networkAccess: false }
     const settings = { cwd, model, sandbox, approvalPolicy: 'never' }
-    let response
-    try {
-      response = sessionId
-        ? await server.request('thread/resume', { threadId: sessionId, excludeTurns: true, ...settings })
-        : await server.request('thread/start', settings)
-    } catch (error) {
-      if (sessionId && /no rollout (found|available)|thread not found|unknown thread|thread.+does not exist/i.test(error.message)) {
-        error.code = 'RDS_SESSION_MISSING'
-      }
-      throw error
-    }
+    const response = sessionId ? await resumeThread(server, sessionId, settings) : await server.request('thread/start', settings)
     threadId = response?.thread?.id
     if (!threadId) throw new Error('Codex app-server 未返回线程 ID。')
     signal.throwIfAborted()

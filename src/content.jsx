@@ -47,7 +47,7 @@ function InlineImage({ src, alt }) {
 
 const targetAsset = (messageId, item) => ({ kind: 'asset', messageId, item })
 
-export function ContentMarkdown({ text, artifacts = [], threadId, messageId, onView, mentionPlugin }) {
+export function ContentMarkdown({ text, artifacts = [], threadId, messageId, onView, mentionPlugin, onConversation }) {
   const target = href => {
     const destination = linkDestination(href)
     if (destination?.url) return { kind: 'browser', url: destination.url }
@@ -58,6 +58,9 @@ export function ContentMarkdown({ text, artifacts = [], threadId, messageId, onV
   return <ReactMarkdown remarkPlugins={mentionPlugin ? [remarkGfm, mentionPlugin] : [remarkGfm]}
     urlTransform={url => target(url) ? url : defaultUrlTransform(url)}
     components={{
+      mark: ({ node, children, ...props }) => props['data-conversation'] && onConversation
+        ? <button type="button" className="mention-copy conversation-reference" onClick={() => onConversation(props['data-conversation'])}>{children}</button>
+        : <mark {...props}>{children}</mark>,
       a: ({ href, children }) => {
         const view = target(href)
         if (view?.kind === 'browser' && typeof children === 'string') view.name = children.trim().slice(0, 100)

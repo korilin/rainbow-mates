@@ -7,8 +7,27 @@ import { codexActivity, dshActivity } from '../desktop/activity.mjs'
 import { readAssetPreview, resolveAsset, streamAsset } from '../desktop/content.mjs'
 import { References, referenceContext } from '../desktop/references.mjs'
 import { artifactLinks, linkDestination } from '../shared/content-links.mjs'
+import { rebaseReferences, referenceTrigger, referencesForSend } from '../shared/composer-references.mjs'
 import { directedMembers } from '../shared/mentions.mjs'
 import { workspaceAsset, workspaceEntries, workspaceReferencePath } from '../desktop/workspace-files.mjs'
+
+test('reference triggers support display names and relative paths', () => {
+  assert.deepEqual(referenceTrigger('看看 @Codex 龙娘', 12), { symbol: '@', query: 'Codex 龙娘', start: 3, end: 12 })
+  assert.deepEqual(referenceTrigger('@docs/pl', 8), { symbol: '@', query: 'docs/pl', start: 0, end: 8 })
+  assert.deepEqual(referenceTrigger('先 /检查构建', 7), { symbol: '/', query: '检查构建', start: 2, end: 7 })
+  assert.deepEqual(referenceTrigger('字面 @ 再 /构建', 10), { symbol: '/', query: '构建', start: 7, end: 10 })
+  assert.equal(referenceTrigger('https://example.com/file', 24), null)
+  assert.equal(referenceTrigger('someone@example.com', 19), null)
+})
+
+test('inline references follow edits outside their text and disappear when edited', () => {
+  const text = '$构建工具 再检查'
+  const spans = [{ kind: 'skill', id: 'skill', symbol: '$', start: 0, end: 5 }]
+  assert.deepEqual(rebaseReferences(text, '  ' + text, spans).map(({ start, end }) => [start, end]), [[2, 7]])
+  assert.deepEqual(rebaseReferences(text, '$检查工具 再检查', spans), [])
+  assert.deepEqual(rebaseReferences(text, text + '一下', spans), spans)
+  assert.deepEqual(referencesForSend('  ' + text, [{ ...spans[0], start: 2, end: 7 }]), { text, inlineReferences: spans })
+})
 
 test('conversation links identify file paths, inline animation and web URLs', () => {
   const links = artifactLinks([
