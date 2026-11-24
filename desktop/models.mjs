@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { readDshProvider, runtimeEnv } from './runtimes.mjs'
+import { codexClientInfo } from './app-version.mjs'
 
 function queryCatalog({ binary, cwd, args, initial, follow, initialized, jsonrpc = false }) {
   return new Promise((resolve, reject) => {
@@ -41,7 +42,7 @@ function queryCatalog({ binary, cwd, args, initial, follow, initialized, jsonrpc
 async function codexCatalog(binary, cwd) {
   const result = await queryCatalog({
     binary, cwd, args: ['app-server', '--listen', 'stdio://'],
-    initial: { method: 'initialize', params: { clientInfo: { name: 'rainbow_mates', version: '0.1.0' } } },
+    initial: { method: 'initialize', params: { clientInfo: codexClientInfo } },
     initialized: { method: 'initialized' },
     follow: { method: 'model/list', params: { includeHidden: false } },
   })
@@ -57,6 +58,19 @@ async function codexCatalog(binary, cwd) {
     models.push(entry)
   }
   return { models }
+}
+
+export async function readCodexSkills(binary, cwd) {
+  const result = await queryCatalog({
+    binary, cwd, args: ['app-server', '--listen', 'stdio://'],
+    initial: { method: 'initialize', params: { clientInfo: codexClientInfo } },
+    initialized: { method: 'initialized' },
+    follow: { method: 'skills/list', params: { cwds: [cwd] } },
+  })
+  return result.data.flatMap(entry => entry.skills.filter(skill => skill.enabled).map(skill => ({
+    kind: 'skill', runtime: 'codex', name: skill.name, path: skill.path,
+    description: skill.shortDescription || skill.description, key: skill.path,
+  })))
 }
 
 async function dshCatalog(binary, cwd) {

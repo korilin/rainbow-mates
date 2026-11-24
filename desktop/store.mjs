@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { DEFAULT_THREAD_GROUP } from '../shared/thread-groups.mjs'
 
 export function seed() {
   return {
     version: 1,
     settings: { codexPath: '', deepseekPath: '' },
+    threadGroups: [{ id: DEFAULT_THREAD_GROUP, name: '默认分组' }],
     roles: [
       { id: 'codex', name: 'Codex 龙娘', type: 'codex', label: '研发', form: 'chibi', personality: '冷静利落、有一点傲娇。写代码时严谨，聊天时自然。习惯先看证据再给结论。' },
       { id: 'deepseek', name: 'DeepSeek 娘', type: 'deepseek', label: '产品', form: 'chibi', personality: '温和好奇，擅长拆解需求和组织想法。乐于接梗，提出异议时具体清楚。' },
@@ -25,12 +27,21 @@ export class Store {
     this.value = existsSync(filename) ? JSON.parse(readFileSync(filename, 'utf8')) : seed()
     if (this.value.version !== 1) throw new Error('本地数据版本不受支持。')
     let recovered = false
-    for (const key of ['codexModel', 'deepseekModel']) {
+    for (const key of ['codexModel', 'deepseekModel', 'routing']) {
       if (!Object.hasOwn(this.value.settings, key)) continue
       delete this.value.settings[key]
       recovered = true
     }
     const defaults = seed()
+    if (!Array.isArray(this.value.threadGroups)) {
+      this.value.threadGroups = defaults.threadGroups
+      recovered = true
+    } else if (!this.value.threadGroups.some(group => group.id === DEFAULT_THREAD_GROUP)) {
+      this.value.threadGroups.unshift(defaults.threadGroups[0])
+      recovered = true
+    }
+    const groupIds = new Set(this.value.threadGroups.map(group => group.id))
+    const threadsById = new Map(this.value.threads.map(thread => [thread.id, thread]))
     const previousLabels = { codex: '研发搭子', deepseek: '产品搭子' }
     for (const role of this.value.roles) {
       if (Object.hasOwn(previousLabels, role.id) && role.label === previousLabels[role.id]) {
@@ -39,6 +50,15 @@ export class Store {
       }
     }
     for (const thread of this.value.threads) {
+      if (!thread.parentId && !groupIds.has(thread.groupId)) {
+        thread.groupId = DEFAULT_THREAD_GROUP
+        recovered = true
+      }
+      if (!Number.isFinite(thread.activityAt)) {
+        thread.activityAt = thread.messages.reduce((latest, message) => message.text && (!message.author || message.status === 'done')
+          ? Math.max(latest, Number(message.at) || 0) : latest, 0)
+        recovered = true
+      }
       if (thread.id === 'clubroom' && thread.name === '同桌茶话会') {
         thread.name = defaults.threads[0].name
         recovered = true
@@ -54,8 +74,8 @@ export class Store {
           message.error = '上次退出时，这轮回复尚未完成。'
           recovered = true
         }
-        if (['queued', 'running'].includes(message.routing?.status)) {
-          message.routing = { status: 'stopped', error: '上次退出时，分流尚未完成。' }
+        if (Object.hasOwn(message, 'routing')) {
+          delete message.routing
           recovered = true
         }
       }
@@ -70,6 +90,14 @@ export class Store {
           if (message.text && (!message.author || message.status === 'done')) message.seq = ++thread.messageSeq
         }
         recovered = true
+      }
+    }
+    for (const thread of this.value.threads) {
+      let parent = threadsById.get(thread.parentId)
+      while (parent && parent.activityAt < thread.activityAt) {
+        parent.activityAt = thread.activityAt
+        recovered = true
+        parent = threadsById.get(parent.parentId)
       }
     }
     if (!existsSync(filename) || recovered) this.save(this.value)

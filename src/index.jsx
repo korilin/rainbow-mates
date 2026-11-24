@@ -1,34 +1,43 @@
 import React, { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import ReactMarkdown from 'react-markdown'
+import { fileIcon } from './file-icon.jsx'
+import { ContentMarkdown, ContentPanel, GeneratedMedia, contentKey, workspaceTabId } from './content.jsx'
 import {
-  ArrowDown, ArrowLeft, ArrowRight, ArrowUp, AtSign, Check, ChevronRight,
-  CircleAlert, CodeXml, FileText, Folder, Hash, Images, Lightbulb,
-  MessageSquare, Monitor, PanelLeft, PanelRight, PencilLine, Plus, Reply,
-  Send, Settings, Sparkles, Square, Trash2, UserRound, UsersRound, X,
+  ArrowDown, ArrowLeft, ArrowRight, ArrowUp, AtSign, BookOpen, Check, ChevronRight,
+  CircleAlert, ClipboardList, CodeXml, Copy, Download, Ellipsis, FileText, Folder, FolderInput, FolderOpen, FolderPlus, Images, Lightbulb,
+  MessageSquare, Monitor, Moon, PanelLeft, PanelRight, Paperclip, PencilLine, Plus, Puzzle, Reply,
+  Send, Settings, Sparkles, Sun, Trash2, UserRound, UsersRound, X,
 } from 'lucide-react'
 import '@fontsource-variable/nunito'
-import { productName, version } from '../package.json'
+import { productName } from '../package.json'
 import { findMentions } from '../shared/mentions.mjs'
+import { DEFAULT_THREAD_GROUP } from '../shared/thread-groups.mjs'
+import { workspaceFileDrag } from '../shared/file-drop.mjs'
+import { appTheme } from '../shared/theme.mjs'
+import { mediaType, referenceImageURL } from '../shared/content-links.mjs'
 import './style.css'
 
 const api = window.rainbow
+const initialTheme = appTheme(new URLSearchParams(location.search).get('theme'))
+document.documentElement.dataset.theme = initialTheme
 const runtimeLabel = { codex: 'Codex', deepseek: 'DeepSeek' }
-const roomIcons = { chat: Hash, ideas: Lightbulb, code: CodeXml, reply: Reply }
+const roomIcons = { ideas: Lightbulb, code: CodeXml, reply: Reply }
+const threadDragType = 'application/x-rainbow-thread-id'
+const byActivity = (a, b) => b.activityAt - a.activityAt
 const appIcon = './app-icon.png'
 const art = (type, form = 'chibi') => './art/' + type + '-' + form + '.png'
 const byId = (items, id) => items.find(item => item.id === id)
-const pending = status => status === 'queued' || status === 'running'
-const chatWorking = thread => thread.messages.some(message => pending(message.status) || pending(message.routing?.status))
+const roleStatus = { disconnected: '未连接', working: '任务中', replying: '回复中', idle: '空闲' }
+const referenceIcons = { directory: Folder, skill: BookOpen, plugin: Puzzle }
 const time = timestamp => new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false }).format(timestamp)
 const effortLabels = { none: '关闭', off: '关闭', minimal: 'Minimal', low: 'Low', medium: 'Medium',
   high: 'High', xhigh: 'Extra High', max: 'Max', ultra: 'Ultra' }
 const effortLabel = effort => effortLabels[effort] || effort
 const modelLabel = (model, effort) => [model, effort && effortLabel(effort)].filter(Boolean).join(' · ')
 const triggers = [
-  { title: '让每个人打个招呼', text: '大家用自己的风格打个招呼吧，顺便说说你想在同一桌做什么。', icon: Sparkles },
-  { title: '一起想个点子', text: '我们一起想一个适合周末做的小项目。请每个人接上前一位的想法。', icon: Lightbulb },
-  { title: '试试分工协作', text: '用一个具体例子演示产品和研发会怎样分工。请互相参考前一位的回复。', icon: UsersRound },
+  { title: '让每个人打个招呼', text: '大家用自己的风格打个招呼，顺便说说你擅长什么。', icon: Sparkles },
+  { title: '一起想个点子', text: '我们一起想一个适合周末做的小项目。大家可以贡献自己感兴趣的点子。', icon: Lightbulb },
+  { title: '试试分工协作', text: '用一个具体例子演示产品和研发会怎样分工。请各自说说你会负责哪部分。', icon: UsersRound },
 ]
 
 function Avatar({ role, size = '' }) {
@@ -191,6 +200,41 @@ function DeleteThreadDialog({ thread, hasReplies, close }) {
   </Dialog>
 }
 
+function GroupNameDialog({ group, close }) {
+  const [name, setName] = useState(group?.name || '')
+  const { error, busy, save } = useSave(close)
+  const title = group ? '重命名分组' : '新建分组'
+  return <Dialog title={title} close={close}>
+    <form className="stack" onSubmit={event => save(event, group ? 'renameThreadGroup' : 'createThreadGroup', { groupId: group?.id, name })}>
+      <label>分组名<input autoFocus required maxLength={40} value={name} onChange={event => setName(event.target.value)} /></label>
+      <FormFooter error={error} close={close} label={group ? '保存名称' : '创建分组'} busy={busy} />
+    </form>
+  </Dialog>
+}
+
+function DeleteGroupDialog({ group, close }) {
+  const { error, busy, save } = useSave(close)
+  return <Dialog title="移除分组" close={close}>
+    <form className="stack" onSubmit={event => save(event, 'deleteThreadGroup', { groupId: group.id })}>
+      <p className="dialog-note delete-note">移除「{group.name}」后，组内会话会移到默认分组。</p>
+      <FormFooter error={error} close={close} label="移除分组" busy={busy} danger />
+    </form>
+  </Dialog>
+}
+
+function MoveThreadDialog({ thread, groups, close }) {
+  const [groupId, setGroupId] = useState(groups.find(group => group.id !== thread.groupId)?.id || thread.groupId)
+  const { error, busy, save } = useSave(close)
+  return <Dialog title="移动到分组" close={close}>
+    <form className="stack" onSubmit={event => save(event, 'moveThread', { threadId: thread.id, groupId })}>
+      <label>目标分组<select value={groupId} onChange={event => setGroupId(event.target.value)}>
+        {groups.filter(group => group.id !== thread.groupId).map(group => <option key={group.id} value={group.id}>{group.name}</option>)}
+      </select></label>
+      <FormFooter error={error} close={close} label="移动会话" busy={busy} />
+    </form>
+  </Dialog>
+}
+
 async function choosePath(kind, update, fail) {
   try {
     const path = await api.pick(kind)
@@ -198,7 +242,35 @@ async function choosePath(kind, update, fail) {
   } catch (error) { fail(errorText(error)) }
 }
 
-function ThreadFields({ data, update, defaultDirectory, onError }) {
+function ComputerPermissions({ onError }) {
+  const [permissions, setPermissions] = useState(null)
+  useEffect(() => {
+    let mounted = true
+    const refresh = () => api.computerAccess()
+      .then(value => { if (mounted) setPermissions(value) })
+      .catch(error => { if (mounted) onError(errorText(error)) })
+    void refresh()
+    window.addEventListener('focus', refresh)
+    return () => { mounted = false; window.removeEventListener('focus', refresh) }
+  }, [onError])
+  const request = async kind => {
+    try { setPermissions(await api.computerAccess(kind)) }
+    catch (error) { onError(errorText(error)) }
+  }
+  return <div className="computer-permissions">
+    <p className="dialog-note">成员执行任务时可以查看和操作此 Mac 的界面。界面文字和截图可能发送给成员所用的模型。</p>
+    {permissions?.supported && <div className="computer-permission-actions">
+      {permissions.accessibility ? <span>辅助功能已授权</span>
+        : <button type="button" className="secondary-button" onClick={() => request('accessibility')}>授权辅助功能</button>}
+      {permissions.screen ? <span>屏幕录制已授权</span>
+        : <button type="button" className="secondary-button" onClick={() => request('screen')}>授权屏幕录制</button>}
+    </div>}
+    {permissions?.supported && (!permissions.accessibility || !permissions.screen) &&
+      <p className="dialog-note">也可以在「系统设置 → 隐私与安全性」给 Rainbow Mates 授权。屏幕录制授权后可能需要重启应用。</p>}
+  </div>
+}
+
+function ThreadFields({ data, update, defaultDirectory, computerAvailable, onError }) {
   return <>
     <label>会话名称<input required maxLength={60} value={data.name} onChange={event => update('name', event.target.value)} placeholder="比如：发布计划" /></label>
     <label>会话详情<textarea rows={3} maxLength={4000} value={data.description} onChange={event => update('description', event.target.value)}
@@ -208,6 +280,11 @@ function ThreadFields({ data, update, defaultDirectory, onError }) {
       <IconButton icon={Folder} label="选择工作目录" onClick={() => choosePath('directory', value => update('cwd', value), onError)} /></span></label>
     <label className="check-label"><input type="checkbox" disabled={!data.cwd} checked={Boolean(data.cwd && data.writeAccess)} onChange={event => update('writeAccess', event.target.checked)} />允许写入工作目录</label>
     <label className="check-label"><input type="checkbox" checked={data.autoHandoff !== false} onChange={event => update('autoHandoff', event.target.checked)} />允许 Agent 直接交接</label>
+    {computerAvailable && <>
+      <label className="check-label"><input type="checkbox" checked={data.computerUse === true}
+        onChange={event => update('computerUse', event.target.checked)} />允许 Computer Use</label>
+      {data.computerUse && <ComputerPermissions onError={onError} />}
+    </>}
   </>
 }
 
@@ -222,13 +299,13 @@ function RoleChoices({ roles, roleIds, onChange }) {
   </div>
 }
 
-function ThreadDialog({ roles, defaultDirectory, close, onSaved }) {
+function ThreadDialog({ roles, defaultDirectory, computerAvailable, close, onSaved }) {
   const [data, setData] = useState({ name: '', description: '', cwd: '', roleIds: roles.map(role => role.id), writeAccess: false, autoHandoff: true })
   const { error, busy, save, setError } = useSave(onSaved)
   const update = (name, value) => setData(prev => ({ ...prev, [name]: value }))
   return <Dialog title="新建会话" close={close}>
     <form className="stack" onSubmit={event => save(event, 'room', data)}>
-      <ThreadFields data={data} update={update} defaultDirectory={defaultDirectory} onError={setError} />
+      <ThreadFields data={data} update={update} defaultDirectory={defaultDirectory} computerAvailable={computerAvailable} onError={setError} />
       <fieldset>
         <legend>会话成员</legend>
         <RoleChoices roles={roles} roleIds={data.roleIds} onChange={value => update('roleIds', value)} />
@@ -250,24 +327,6 @@ function ThreadMembersDialog({ thread, roles, close }) {
   </Dialog>
 }
 
-function NoteDialog({ thread, file, close }) {
-  const [content, setContent] = useState(null)
-  const [error, setError] = useState('')
-  useEffect(() => {
-    let alive = true
-    api.run('readNote', { threadId: thread.id, file }).then(text => { if (alive) setContent(text) })
-      .catch(failure => { if (alive) setError(errorText(failure)) })
-    return () => { alive = false }
-  }, [thread.id, file])
-  return <Dialog title={file} close={close} wide>
-    {error ? <div className="form-error" role="alert"><CircleAlert size={16} />{error}</div>
-      : content === null ? <p className="dialog-note" role="status">正在读取笔记…</p>
-      : <div className="bubble note-document"><ReactMarkdown
-        components={{ img: ({ alt }) => <span>{alt || '[图片]'}</span>, a: ({ children }) => <span className="message-link">{children}</span> }}>
-        {content}</ReactMarkdown></div>}
-  </Dialog>
-}
-
 function DeleteNoteDialog({ thread, file, close }) {
   const { error, busy, save } = useSave(close)
   return <Dialog title="删除笔记" close={close}>
@@ -281,38 +340,42 @@ function DeleteNoteDialog({ thread, file, close }) {
 function SettingsDialog({ settings, runtimes, close }) {
   const [data, setData] = useState(settings)
   const { error, busy, save, setError } = useSave(close)
+  const theme = appTheme(settings.theme)
   const update = (name, value) => setData(prev => ({ ...prev, [name]: value }))
-  const routing = data.routing || { type: '', model: '', effort: '' }
-  const catalog = useModelCatalog(routing.type)
-  const selected = catalog.models.find(model => model.id === routing.model)
-  const effort = selected && !selected.efforts.length ? '' : routing.effort
-  const updateRouting = values => update('routing', { ...routing, ...values })
-  return <Dialog title="运行时设置" close={close}>
-    <form className="stack" onSubmit={event => save(event, 'runtimeSettings', { ...data, routing: { ...routing, effort } })}>
-      <p className="dialog-note">沿用 Codex 和 DSH 现有的登录。留空时自动查找已安装的客户端。</p>
-      {runtimes.map(runtime => {
-        const key = runtime.type + 'Path'
-        return <label key={key}>{runtimeLabel[runtime.type]} 可执行文件<span className="path-input">
-          <input value={data[key]} onChange={e => update(key, e.target.value)} placeholder={runtime.path || '未找到，请选择文件'} />
-          <IconButton icon={Folder} label={'选择 ' + runtimeLabel[runtime.type] + ' 可执行文件'} onClick={() => choosePath('file', value => update(key, value), setError)} />
-        </span></label>
-      })}
-      <fieldset className="routing-settings stack">
-        <legend>自动分流</legend>
-        <label>分流运行时<select value={routing.type} onChange={event => updateRouting({ type: event.target.value, model: '', effort: '' })}>
-          <option value="">未配置</option>
-          {runtimes.map(runtime => <option key={runtime.type} value={runtime.type}>{runtimeLabel[runtime.type]}</option>)}
-        </select></label>
-        {routing.type && <ModelPicker catalog={catalog} value={routing.model} effort={effort} selected={selected} modelField="分流模型" effortField="分流推理强度"
-          onChange={model => updateRouting({ model, effort: '' })} onEffort={value => updateRouting({ effort: value })} />}
+  function changeTheme(event) {
+    setError('')
+    void api.run('appearanceSettings', { theme: event.currentTarget.value }).catch(failure => setError(errorText(failure)))
+  }
+  return <Dialog title="设置" close={close}>
+    <fieldset className="appearance-settings">
+      <legend>主题</legend>
+      <div className="theme-options">
+        {[['light', '浅色', Sun], ['dark', '深色', Moon]].map(([id, label, Icon]) => <label key={id}>
+          <input type="radio" name="theme" value={id} checked={theme === id} onChange={changeTheme} />
+          <Icon size={16} aria-hidden="true" /><span>{label}</span>
+          {theme === id && <Check size={14} className="theme-selected" aria-hidden="true" />}
+        </label>)}
+      </div>
+    </fieldset>
+    <form className="stack" onSubmit={event => save(event, 'runtimeSettings', data)}>
+      <fieldset className="stack">
+        <legend>运行时</legend>
+        <p className="dialog-note">沿用 Codex 和 DSH 现有的登录。留空时自动查找已安装的客户端。</p>
+        {runtimes.map(runtime => {
+          const key = runtime.type + 'Path'
+          return <label key={key}>{runtimeLabel[runtime.type]} 可执行文件<span className="path-input">
+            <input value={data[key]} onChange={e => update(key, e.target.value)} placeholder={runtime.path || '未找到，请选择文件'} />
+            <IconButton icon={Folder} label={'选择 ' + runtimeLabel[runtime.type] + ' 可执行文件'} onClick={() => choosePath('file', value => update(key, value), setError)} />
+          </span></label>
+        })}
       </fieldset>
-      <FormFooter error={error} close={close} label="保存设置" busy={busy} />
+      <FormFooter error={error} close={close} label="保存运行时设置" busy={busy} />
     </form>
   </Dialog>
 }
 
 function BranchLinks({ parentId, threads, selectedId, select, openMenu, depth = 1 }) {
-  return threads.filter(thread => thread.parentId === parentId).map(thread =>
+  return threads.filter(thread => thread.parentId === parentId).sort(byActivity).map(thread =>
     <React.Fragment key={thread.id}>
       <button className={'room-link branch-link ' + (selectedId === thread.id ? 'current-branch' : '')}
         style={{ '--branch-indent': Math.min(depth, 4) * 10 + 'px' }} onClick={() => select(thread.id)} onContextMenu={event => openMenu(event, thread)}
@@ -321,7 +384,9 @@ function BranchLinks({ parentId, threads, selectedId, select, openMenu, depth = 
     </React.Fragment>)
 }
 
-function SideBar({ state, page, navigate, show, close, command, openMenu }) {
+function SideBar({ state, page, navigate, show, close, command, sidebarAction, openMenu }) {
+  const drag = useRef(null)
+  const [dropGroup, setDropGroup] = useState(null)
   const room = byId(state.threads, state.activeThreadId)
   let root = room
   while (root?.parentId) root = byId(state.threads, root.parentId)
@@ -331,11 +396,13 @@ function SideBar({ state, page, navigate, show, close, command, openMenu }) {
     navigate('chat')
     close()
   }
+  const clearDrag = () => { drag.current = null; setDropGroup(null) }
+  const droppable = (event, groupId) => drag.current && drag.current.groupId !== groupId && event.dataTransfer.types.includes(threadDragType)
   return <aside className="sidebar">
     <section className="sidebar-top">
       <div className="workspace-title">
         <img className="workspace-logo" src={appIcon} alt="" />
-        <div><strong>{productName}</strong><small>v{version}</small></div>
+        <div><strong>{productName}</strong><small>v{state.appVersion}{!state.packaged && ' · 开发'}</small></div>
       </div>
       <div className="nav-switch" aria-label="工作区导航">
         <button aria-pressed={page === 'chat'} onClick={() => { navigate('chat'); close() }}><MessageSquare size={16} /> 会话</button>
@@ -343,18 +410,56 @@ function SideBar({ state, page, navigate, show, close, command, openMenu }) {
       </div>
     </section>
     <div className="sidebar-scroll">
-      <div className="side-heading"><span>我的会话</span><IconButton icon={Plus} label="新建会话" onClick={() => show({ type: 'room' })} /></div>
+      <div className="side-heading"><span>我的会话</span><IconButton icon={FolderPlus} label="新建分组" onClick={() => { show({ type: 'newGroup' }); close() }} /></div>
       <nav aria-label="我的会话">
-        {state.threads.filter(thread => !thread.parentId).map(thread => {
-          const Icon = roomIcons[thread.kind] || Hash
-          const selected = page === 'chat' && root?.id === thread.id
-          return <div key={thread.id}>
-            <button className={'room-link ' + (selected ? 'selected' : '')} onClick={() => select(thread.id)} onContextMenu={event => openMenu(event, thread)}
-              aria-current={page === 'chat' && room?.id === thread.id ? 'page' : undefined}>
-              <Icon size={17} /><span>{thread.name}</span>{selected && <span className="nav-dot" />}
-            </button>
-            {selected && <BranchLinks parentId={thread.id} threads={state.threads} selectedId={room.id} select={select} openMenu={openMenu} />}
-          </div>
+        {state.threadGroups.map(group => {
+          const threads = state.threads.filter(thread => !thread.parentId && thread.groupId === group.id).sort(byActivity)
+          const FolderIcon = group.collapsed ? Folder : FolderOpen
+          const listId = 'group-threads-' + group.id
+          return <section key={group.id} aria-label={group.name} className={'thread-group' + (dropGroup === group.id ? ' drop-target' : '')}
+            onDragOver={event => {
+              if (!droppable(event, group.id)) return
+              event.preventDefault()
+              event.dataTransfer.dropEffect = 'move'
+              setDropGroup(group.id)
+            }}
+            onDragLeave={event => {
+              if (!event.currentTarget.contains(event.relatedTarget)) setDropGroup(current => current === group.id ? null : current)
+            }}
+            onDrop={event => {
+              if (!droppable(event, group.id)) return
+              event.preventDefault()
+              const threadId = event.dataTransfer.getData(threadDragType)
+              if (threadId === drag.current.id) void sidebarAction(() => api.run('moveThread', { threadId, groupId: group.id }))
+              clearDrag()
+            }}>
+            <div className="thread-group-header" onContextMenu={group.id === DEFAULT_THREAD_GROUP ? undefined : event => openMenu(event, group, 'group')}>
+              <button className="thread-group-toggle" type="button" aria-expanded={!group.collapsed} aria-controls={listId}
+                onClick={() => sidebarAction(() => api.run('collapseThreadGroup', { groupId: group.id, collapsed: !group.collapsed }))}>
+                <FolderIcon className="folder-icon" size={16} aria-hidden="true" /><span>{group.name}</span><ChevronRight className="group-chevron" size={13} aria-hidden="true" />
+              </button>
+              {group.id !== DEFAULT_THREAD_GROUP && <IconButton className="thread-group-menu" icon={Ellipsis} label={'管理分组 ' + group.name}
+                aria-haspopup="menu" onClick={event => openMenu(event, group, 'group')} />}
+            </div>
+            <div className="thread-group-list" id={listId} hidden={Boolean(group.collapsed)}>
+              {!threads.length && <div className="thread-group-empty">暂无会话</div>}
+              {threads.map(thread => {
+                const selected = page === 'chat' && root?.id === thread.id
+                return <div key={thread.id}>
+                  <button className={'room-link ' + (selected ? 'selected' : '')} onClick={() => select(thread.id)} onContextMenu={event => openMenu(event, thread)}
+                    aria-current={page === 'chat' && room?.id === thread.id ? 'page' : undefined}
+                    draggable onDragStart={event => {
+                      drag.current = { id: thread.id, groupId: group.id }
+                      event.dataTransfer.effectAllowed = 'move'
+                      event.dataTransfer.setData(threadDragType, thread.id)
+                    }} onDragEnd={clearDrag}>
+                    <span>{thread.name}</span>{selected && <span className="nav-dot" />}
+                  </button>
+                  {selected && <BranchLinks parentId={thread.id} threads={state.threads} selectedId={room.id} select={select} openMenu={openMenu} />}
+                </div>
+              })}
+            </div>
+          </section>
         })}
       </nav>
       <button className="ghost-new" onClick={() => { show({ type: 'room' }); close() }}><Plus size={16} />新建会话</button>
@@ -367,7 +472,7 @@ function SideBar({ state, page, navigate, show, close, command, openMenu }) {
   </aside>
 }
 
-function ThreadContextMenu({ menu, close, choose }) {
+function SidebarContextMenu({ menu, close, choose, canMove }) {
   const ref = useRef(null)
   useLayoutEffect(() => {
     const element = ref.current
@@ -379,7 +484,8 @@ function ThreadContextMenu({ menu, close, choose }) {
     document.addEventListener('pointerdown', outside)
     return () => document.removeEventListener('pointerdown', outside)
   }, [menu, close])
-  return <div className="pop-menu thread-menu" role="menu" aria-label="会话操作" ref={ref} onKeyDown={event => {
+  const group = menu.kind === 'group'
+  return <div className="pop-menu thread-menu" role="menu" aria-label={group ? '分组操作' : '会话操作'} ref={ref} onKeyDown={event => {
     if (event.key === 'Escape') {
       event.preventDefault()
       close()
@@ -393,8 +499,16 @@ function ThreadContextMenu({ menu, close, choose }) {
     }
     if (event.key === 'Tab') close()
   }}>
-    <button type="button" role="menuitem" onClick={() => choose('renameThread')}><PencilLine size={15} />重命名</button>
-    <button type="button" role="menuitem" className="delete-action" onClick={() => choose('deleteThread')}><Trash2 size={15} />删除</button>
+    <button type="button" role="menuitem" onClick={() => choose(group ? 'renameGroup' : 'renameThread')}><PencilLine size={15} />重命名</button>
+    {!group && <>
+      <button type="button" role="menuitem" onClick={() => choose('sessionSettings')}><Settings size={15} />会话设置</button>
+      {canMove && <button type="button" role="menuitem" onClick={() => choose('moveThread')}><FolderInput size={15} />移动到分组</button>}
+      <button type="button" role="menuitem" className="thread-id-item" aria-label="复制会话 ID" title={menu.id}
+        onClick={() => choose('copyThreadId')}><Copy size={15} /><span>复制会话 ID</span><code>{menu.id}</code></button>
+      <button type="button" role="menuitem" onClick={() => choose('exportThread')}><Download size={15} />导出会话</button>
+    </>}
+    <button type="button" role="menuitem" className="delete-action" onClick={() => choose(group ? 'deleteGroup' : 'deleteThread')}>
+      <Trash2 size={15} />{group ? '移除分组' : '删除'}</button>
   </div>
 }
 
@@ -443,14 +557,12 @@ function remarkMentions(roles) {
   }
 }
 
-const taskStatus = { queued: '排队中', running: '进行中', done: '已完成', unassigned: '待认领', blocked: '前置未完成', error: '失败', stopped: '已停止' }
-
 function QuoteContent({ message, roles }) {
   const name = byId(roles, message.author?.id)?.name || message.author?.name || '你'
   return <span className="quote-content"><strong>{name}</strong><span>{message.text.replace(/\s+/g, ' ').slice(0, 180)}</span></span>
 }
 
-function Message({ message, draft, thread, roles, onReply, onInvite, onTask, openRouting }) {
+function Message({ message, draft, thread, roles, onReply, onInvite, onView }) {
   const [show, toggle] = useState(false)
   const { author, status } = message
   const working = status === 'running' || status === 'queued'
@@ -458,14 +570,14 @@ function Message({ message, draft, thread, roles, onReply, onInvite, onTask, ope
   const currentRole = author && byId(roles, author.id)
   const displayRole = currentRole || author
   const currentModel = currentRole?.modelInfo
-  const canAct = !working && !error && status !== 'held'
+  const canAct = !working && !error
   const receivers = (message.targetIds || []).map(id => byId(roles, id)?.name).filter(Boolean)
   const assignable = thread.roleIds.filter(id => id !== author?.id).map(id => byId(roles, id)).filter(Boolean)
   const handoff = byId(roles, message.handoffTo)
-  const tasks = thread.tasks || []
-  const task = byId(tasks, message.taskId)
+  const associatedTaskId = message.taskId || message.taskThreadId || (!message.handoffFrom && message.relatedTaskId)
+  const task = author && canAct && associatedTaskId && byId(thread.tasks || [], associatedTaskId)
+  const taskThread = task && thread.messages.some(run => run.taskId === task.id && run.author?.id === author.id) ? task : null
   const quoted = message.replyToId && byId(thread.messages, message.replyToId)
-  const attached = author ? [] : tasks.filter(item => item.sourceMessageId === message.id)
   return <article id={'message-' + message.id} className={'message ' + (author?.type || 'human') + (error ? ' message-error' : '')}>
     <Avatar role={displayRole} />
     <div className="message-body">
@@ -479,50 +591,135 @@ function Message({ message, draft, thread, roles, onReply, onInvite, onTask, ope
         {quoted && <button type="button" className="message-quote" onClick={() => {
           document.getElementById('message-' + quoted.id)?.scrollIntoView({ block: 'center' })
         }}><QuoteContent message={quoted} roles={roles} /></button>}
-        {status === 'held' ? <details><summary>收到新要求，旧草稿已搁置</summary><p>{message.heldText}</p></details>
-          : working && !draft ? <span className="working"><span className="typing"><i /><i /><i /></span>{status === 'queued' ? '等待接话' : '正在回复'}</span>
+        {working && !draft ? <span className="working"><span className="typing"><i /><i /><i /></span>{status === 'queued' ? '等待接话' : '正在回复'}</span>
           : error ? <span className="message-failure"><CircleAlert size={16} />{message.error}</span>
-          : <ReactMarkdown remarkPlugins={[remarkMentions(roles)]}
-            components={{ img: ({ alt }) => <span>{alt || '[图片]'}</span>, a: ({ children }) => <span className="message-link">{children}</span> }}>
-            {message.text || draft || ''}</ReactMarkdown>}
+          : <ContentMarkdown text={message.text || draft || ''} artifacts={message.artifacts} threadId={thread.id} messageId={message.id}
+            mentionPlugin={remarkMentions(roles)} onView={onView} />}
+        <GeneratedMedia threadId={thread.id} messageId={message.id} artifacts={message.artifacts || []} onView={onView} />
+        {message.references?.length > 0 && <ReferenceList items={message.references} />}
       </div>
+      {canAct && <div className="message-actions" role="group" aria-label="消息操作">
+        <IconButton icon={Reply} label="回复此消息" onClick={onReply} />
+        {assignable.length > 0 && <div className="invite-wrap" onKeyDown={event => {
+          if (event.key === 'Escape' && show) {
+            toggle(false)
+            event.currentTarget.querySelector('button')?.focus()
+          }
+        }}>
+          <IconButton icon={Send} label="指定成员接手" onClick={() => toggle(!show)} aria-expanded={show} />
+          {show && <><button className="menu-dismiss" aria-label="关闭交接菜单" onClick={() => toggle(false)} />
+            <div className="pop-menu invite-menu"><span>交接给</span>{assignable.map(role =>
+              <button key={role.id} onClick={() => { toggle(false); onInvite(role.id) }}><Avatar role={role} size="tiny" />{role.name}</button>)}</div></>}
+        </div>}
+        {taskThread && <IconButton icon={ClipboardList} className="task-thread-button" label="查看任务线程" onClick={() => onView({
+          kind: 'task', taskId: taskThread.id, memberId: author.id, name: taskThread.title,
+        })} />}
+      </div>}
       {receivers.length > 0 && <div className="delivery-receipt"><AtSign size={12} />{receivers.join('、')}</div>}
-      {task && <div className="delivery-receipt">{task.title}</div>}
-      {pending(message.routing?.status) && <div className="delivery-receipt" role="status">{message.routing.status === 'running' ? '正在分流' : '等待分流'}</div>}
-      {message.routing?.error && <div className="delivery-receipt note-error">{message.routing.error}
-        {message.routing.configure && <button type="button" className="text-button" onClick={openRouting}>设置分流</button>}</div>}
-      {attached.length > 0 && <details className="routed-tasks" open>
-        <summary>任务 · {attached.length}</summary>
-        <ul>{attached.map(item => <li key={item.id}>
-          <span><strong>{item.title}</strong><small>{[byId(roles, item.roleId)?.name,
-            item.status === 'queued' && item.dependsOn.some(id => byId(tasks, id)?.status !== 'done') ? '等待前置任务' : taskStatus[item.status]].filter(Boolean).join(' · ')}</small></span>
-          <button type="button" className="text-button" onClick={() => onTask(item)}>{item.roleId ? '追问' : '指定接手'}</button>
-        </li>)}</ul>
-      </details>}
       {message.handoffFrom && <div className="delivery-receipt"><Reply size={12} />接手来自 {message.handoffFrom} 的消息</div>}
       {handoff && <div className="delivery-receipt"><Send size={12} />交接给 {handoff.name}</div>}
+      {message.taskError && <div className="delivery-receipt note-error"><CircleAlert size={12} />{message.taskError}</div>}
       {message.noteError && <div className="delivery-receipt note-error"><CircleAlert size={12} />{message.noteError}</div>}
     </div>
-    {canAct && <div className="message-actions">
-      <IconButton icon={Reply} label="回复此消息" onClick={onReply} />
-      {assignable.length > 0 && <div className="invite-wrap">
-        <IconButton icon={Send} label="指定成员接手" onClick={() => toggle(!show)} aria-expanded={show} />
-        {show && <><button className="menu-dismiss" aria-label="关闭交接菜单" onClick={() => toggle(false)} />
-          <div className="pop-menu invite-menu"><span>交接给</span>{assignable.map(role =>
-            <button key={role.id} onClick={() => { toggle(false); onInvite(role.id) }}><Avatar role={role} size="tiny" />{role.name}</button>)}</div></>}
-      </div>}
-    </div>}
   </article>
 }
 
-function Composer({ thread, roles, working, fill, error, command, task, clearTask, quote, clearQuote }) {
+function ReferenceList({ items }) {
+  return <ul className="reference-list" aria-label="引用">
+    {items.map(item => {
+      const Icon = referenceIcons[item.kind] || fileIcon(item.path || item.name)
+      return <li key={item.id} title={item.path || item.key}>
+        <Icon size={13} aria-hidden="true" /><span>{item.name}</span>
+        {item.runtime && <small>{runtimeLabel[item.runtime]}</small>}
+      </li>
+    })}
+  </ul>
+}
+
+function ComposerReferenceCard({ threadId, item, remove }) {
+  const [brokenImage, setBrokenImage] = useState(false)
+  const filename = item.path || item.name
+  const mime = mediaType(filename)
+  const image = item.kind === 'file' && mime.startsWith('image/')
+  const extension = /\.([a-z0-9]{1,12})$/iu.exec(filename)?.[1].toUpperCase()
+  const kind = image ? '图片' : mime.startsWith('video/') ? '视频' : mime.startsWith('audio/') ? '音频' : '文件'
+  const type = item.kind === 'file' ? [extension, kind].filter(Boolean).join(' ') : item.kind === 'directory' ? '目录'
+    : [item.kind === 'skill' ? 'Skill' : 'Plugin', runtimeLabel[item.runtime]].filter(Boolean).join(' · ')
+  const Icon = referenceIcons[item.kind] || fileIcon(filename, mime)
+  return <li className="composer-attachment" title={filename}>
+    <div className="attachment-preview" aria-hidden="true">
+      {image && !brokenImage
+        ? <img src={referenceImageURL(threadId, item.id)} alt="" decoding="async" onError={() => setBrokenImage(true)} />
+        : <Icon size={22} />}
+    </div>
+    <div className="attachment-description"><strong>{item.name}</strong><small>{type}</small></div>
+    <IconButton icon={X} className="attachment-remove" label={'移除引用 ' + item.name} onClick={() => remove(item.id)} />
+  </li>
+}
+
+function ReferencePicker({ threadId, typedQuery, onChoose, onPath, onClose }) {
+  const [kind, setKind] = useState(() => typedQuery === null ? null : 'skill')
+  const [query, setQuery] = useState('')
+  const [catalogs, setCatalogs] = useState({})
+  const element = useRef(null)
+  const catalog = catalogs[kind]
+  useEffect(() => {
+    if (!kind || catalog) return
+    let live = true
+    api.referenceList(threadId, kind).then(items => {
+      if (live) setCatalogs(previous => ({ ...previous, [kind]: { items } }))
+    }).catch(error => {
+      if (live) setCatalogs(previous => ({ ...previous, [kind]: { error: errorText(error) } }))
+    })
+    return () => { live = false }
+  }, [threadId, kind, catalog])
+  useEffect(() => {
+    const closeOutside = event => {
+      if (!element.current?.contains(event.target) && !event.target.closest('.composer textarea, .reference-toggle')) onClose()
+    }
+    document.addEventListener('pointerdown', closeOutside)
+    return () => document.removeEventListener('pointerdown', closeOutside)
+  }, [onClose])
+  const match = (typedQuery ?? query).trim().toLocaleLowerCase()
+  const items = (catalog?.items || []).filter(item => [item.name, item.description, item.key].some(value => value?.toLocaleLowerCase().includes(match))).slice(0, 60)
+  return <div className="pop-menu reference-picker" ref={element} aria-label="插入引用" onKeyDown={event => {
+    if (event.key === 'Escape') { event.preventDefault(); onClose() }
+  }}>
+    <div className="reference-picker-tabs">
+      <button type="button" onClick={() => onPath('file')}><FileText size={14} />文件…</button>
+      <button type="button" onClick={() => onPath('directory')}><Folder size={14} />目录…</button>
+      <button type="button" aria-pressed={kind === 'skill'} onClick={() => setKind('skill')}><BookOpen size={14} />Skill</button>
+      <button type="button" aria-pressed={kind === 'plugin'} onClick={() => setKind('plugin')}><Puzzle size={14} />Plugin</button>
+    </div>
+    {kind && typedQuery === null && <input aria-label="搜索引用" placeholder="搜索引用" value={query} onChange={event => setQuery(event.target.value)}
+      onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); if (items.length) onChoose(items[0]) } }} />}
+    <div className="reference-results">
+      {kind && !catalog && <div role="status" className="reference-picker-note">正在读取引用…</div>}
+      {catalog?.error && <div role="alert" className="reference-picker-note">{catalog.error}</div>}
+      {catalog?.items && !items.length && <div className="reference-picker-note">没有匹配的引用</div>}
+      {items.map(item => <button type="button" key={item.id} title={item.path || item.key} onClick={() => onChoose(item)}>
+        <span className="reference-result-name"><strong>{item.name}</strong>{item.description && <small>{item.description}</small>}</span>
+        <span className="reference-runtime">{runtimeLabel[item.runtime]}</span>
+      </button>)}
+    </div>
+  </div>
+}
+
+function Composer({ thread, roles, fill, error, command, task, clearTask, quote, clearQuote, attachment, onAttachmentHandled }) {
   const [text, setText] = useState('')
   const [caret, setCaret] = useState(0)
   const [hideMentions, setHideMentions] = useState(false)
   const [sending, setSending] = useState(false)
+  const [references, setReferences] = useState([])
+  const attached = useRef([])
+  const [referenceMenu, setReferenceMenu] = useState(false)
+  const [referenceError, setReferenceError] = useState('')
   const ref = useRef()
   const prefix = text.slice(0, caret)
   const mention = /(?:^|\s)@([^@\n]*)$/u.exec(prefix)
+  const skill = /(?:^|\s)\$([^\s$@]*)$/u.exec(prefix)
+  const typedReference = !referenceMenu && !hideMentions && skill ? skill[1] : null
+  const pickerOpen = referenceMenu || typedReference !== null
   const candidates = mention && !hideMentions ? roles.filter(role => role.name.toLowerCase().includes(mention[1].toLowerCase())) : []
   const fillText = fill?.text
   useEffect(() => {
@@ -545,37 +742,110 @@ function Composer({ thread, roles, working, fill, error, command, task, clearTas
     requestAnimationFrame(() => { ref.current.focus(); ref.current.setSelectionRange(plain.length, plain.length) })
   }
 
+  function closeReferences() { setReferenceMenu(false); setHideMentions(true) }
+
+  function setAttached(items) {
+    attached.current = items
+    setReferences(items)
+  }
+
+  function attach(items, trigger) {
+    if (!items.length) return
+    const combined = [...new Map([...attached.current, ...items].map(item => [item.id, item])).values()]
+    if (combined.length > 8) { setReferenceError('每条消息最多引用 8 项。'); return }
+    setAttached(combined)
+    setReferenceError('')
+    closeReferences()
+    const start = trigger ? prefix.lastIndexOf(trigger) : null
+    if (start !== null && start >= 0) {
+      setText(text.slice(0, start) + text.slice(caret))
+      setCaret(start)
+    }
+    requestAnimationFrame(() => {
+      ref.current?.focus()
+      if (start !== null && start >= 0) ref.current?.setSelectionRange(start, start)
+    })
+  }
+
+  async function pickPaths(kind, trigger) {
+    try { attach(await api.referenceFiles(thread.id, kind), trigger) }
+    catch (failure) { setReferenceError(errorText(failure)) }
+  }
+
+  async function attachFiles({ path, paths }) {
+    try {
+      const items = path ? await api.workspaceReference(thread.id, path) : await api.importFiles(thread.id, paths)
+      if (ref.current) attach(items)
+    } catch (failure) {
+      if (ref.current) setReferenceError(errorText(failure))
+    }
+  }
+
+  useEffect(() => {
+    if (!attachment) return
+    onAttachmentHandled(attachment)
+    void attachFiles(attachment)
+  }, [attachment])
+
+  function pasteFiles(event) {
+    const paths = [...event.clipboardData.files].map(file => api.filePath(file)).filter(Boolean)
+    const clipboard = [...new Set([...paths, ...(api.clipboardFiles() || [])])]
+    if (!clipboard?.length) return
+    event.preventDefault()
+    void attachFiles({ paths: clipboard })
+  }
+
   async function send(event) {
     event?.preventDefault()
     if (sending || !text.trim()) return
     setSending(true)
     try {
-      if (await command('send', { threadId: thread.id, taskId: task?.id, replyToId: quote?.id, text })) {
+      if (await command('send', { threadId: thread.id, taskId: task?.id, replyToId: quote?.id, text,
+        ...(references.length ? { referenceIds: references.map(item => item.id) } : {}) })) {
         setText('')
         setCaret(0)
         setHideMentions(false)
+        setAttached([])
+        setReferenceMenu(false)
+        setReferenceError('')
         if (quote) clearQuote(quote.id)
         ref.current?.focus()
       }
     } finally { setSending(false) }
   }
   return <div className="composer-area">
-    {error && <div role="alert" className="composer-error"><CircleAlert size={15} />{error}</div>}
+    {(error || referenceError) && <div role="alert" className="composer-error"><CircleAlert size={15} />{error || referenceError}</div>}
     <form className="composer" onSubmit={send}>
       {task && <div className="composer-task"><span>追问「{task.title}」</span><IconButton icon={X} label="退出任务追问" onClick={clearTask} /></div>}
       {quote && <div className="composer-quote"><QuoteContent message={quote} roles={roles} />
         <IconButton icon={X} label="取消引用" onClick={() => clearQuote(quote.id)} /></div>}
-      {candidates.length > 0 && <div className="pop-menu mentions-menu"><span>点名成员</span>{candidates.map(role =>
+      {references.length > 0 && <ul className="composer-attachments" aria-label="待发送引用">
+        {references.map(item => <ComposerReferenceCard key={item.id} threadId={thread.id} item={item} remove={id => {
+          setAttached(attached.current.filter(item => item.id !== id))
+          setReferenceError('')
+        }} />)}
+      </ul>}
+      {pickerOpen && <ReferencePicker threadId={thread.id} typedQuery={typedReference}
+        onClose={closeReferences} onChoose={item => attach([item], typedReference !== null ? '$' : undefined)}
+        onPath={kind => pickPaths(kind, typedReference !== null ? '$' : undefined)} />}
+      {mention && !hideMentions && !pickerOpen && <div className="pop-menu mentions-menu"><span>引用</span>{candidates.map(role =>
         <button key={role.id} type="button" onMouseDown={event => event.preventDefault()} onClick={() => insertMention(role)}>
           <Avatar role={role} size="tiny" />{role.name}
           <RoleModelBadge role={role} />
-        </button>)}</div>}
+        </button>)}
+        <button type="button" onMouseDown={event => event.preventDefault()} onClick={() => pickPaths('file', '@')}><FileText size={15} />选择文件…</button>
+        <button type="button" onMouseDown={event => event.preventDefault()} onClick={() => pickPaths('directory', '@')}><Folder size={15} />选择目录…</button>
+      </div>}
       <textarea aria-label="消息" ref={ref} rows={1} maxLength={24000} value={text}
-        placeholder={task && !task.roleId ? '用 @ 指定接手成员，再补充要求…' : '说点什么，或用 @ 点名成员…'}
+        placeholder={task && !task.roleId ? '用 @ 指定接手成员，再补充要求…' : '说点什么，或用 @、$ 插入引用…'}
         onChange={event => { setText(event.target.value); setCaret(event.target.selectionStart); setHideMentions(false) }}
-        onSelect={event => setCaret(event.target.selectionStart)}
+        onSelect={event => setCaret(event.target.selectionStart)} onPaste={pasteFiles}
         onKeyDown={event => {
-          if (event.key === 'Escape') setHideMentions(true)
+          if (event.key === 'Escape') closeReferences()
+          if (event.key.toLowerCase() === 'v' && (event.metaKey || event.ctrlKey) && !event.altKey) {
+            const paths = api.clipboardFiles()
+            if (paths?.length) { event.preventDefault(); void attachFiles({ paths }); return }
+          }
           if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) {
             event.preventDefault()
             if (candidates.length === 1) insertMention(candidates[0])
@@ -584,6 +854,10 @@ function Composer({ thread, roles, working, fill, error, command, task, clearTas
         }} />
       <div className="composer-tools">
         <div className="targets">
+          <IconButton icon={Paperclip} className="reference-toggle" label="插入引用" aria-expanded={pickerOpen} onClick={() => {
+            setReferenceMenu(!referenceMenu)
+            setHideMentions(true)
+          }} />
           <IconButton icon={AtSign} label="点名成员" disabled={!roles.length} onClick={() => {
             const next = text.slice(0, caret) + (caret && !/\s$/.test(prefix) ? ' @' : '@')
             setHideMentions(false)
@@ -593,7 +867,6 @@ function Composer({ thread, roles, working, fill, error, command, task, clearTas
           }} />
         </div>
         <div className="targets">
-          {working && <button type="button" className="stop-button" onClick={() => command('stop', { threadId: thread.id })}><Square size={13} />停止</button>}
           <button className="send-button" type="submit" aria-label="发送消息" title="发送消息 (Enter)" disabled={!text.trim() || sending}><ArrowUp size={19} /></button>
         </div>
       </div>
@@ -602,64 +875,53 @@ function Composer({ thread, roles, working, fill, error, command, task, clearTas
   </div>
 }
 
-function SessionSettings({ thread, roles, runtimes, defaultDirectory, memberSection, show, close }) {
+function SessionSettings({ thread, defaultDirectory, computerAvailable, close }) {
   const [fields, setFields] = useState({})
-  const { error, busy, save, setError } = useSave(() => setFields({}))
+  const { error, busy, save, setError } = useSave(close)
   const data = { ...thread, ...fields }
-  const active = chatWorking(thread)
-  const dirty = Object.keys(fields).some(name => thread[name] !== fields[name])
-  const update = (name, value) => setFields(prev => ({ ...prev, [name]: value }))
-  return <aside id="session-settings" className="roster" aria-label="会话设置">
-    <div className="roster-header"><h2>会话设置</h2><IconButton icon={X} className="close-roster" label="关闭会话设置" onClick={close} /></div>
-    <div className="roster-scroll">
-      <section className="settings-section">
-        <div className="section-heading"><h3>基本信息</h3></div>
-        <form className="thread-basics" onSubmit={event => save(event, 'threadSettings', { threadId: thread.id, ...fields })}>
-          <ThreadFields data={data} update={update} defaultDirectory={defaultDirectory} onError={setError} />
-          {error && <div className="form-error" role="alert"><CircleAlert size={16} />{error}</div>}
-          <button type="submit" className="primary-button" disabled={!dirty || busy || active} title={active ? '回复结束后可保存设置' : undefined}>
-            {busy ? '保存中…' : '保存设置'}
-          </button>
-        </form>
-      </section>
-      <section className="settings-section" ref={memberSection} tabIndex={-1} aria-label="会话成员">
-        <div className="section-heading"><h3>成员</h3><button type="button" className="secondary-button"
-          onClick={() => show({ type: 'threadRoles', threadId: thread.id })}><Plus size={15} />添加成员</button></div>
-        <div className="settings-characters">
-          {roles.map(role => {
-            const runtime = runtimes.find(item => item.type === role.type)
-            const running = thread.messages.some(message => message.author?.id === role.id && message.status === 'running')
-            const model = role.modelInfo
-            const configured = model && !model.unavailable && !model.needsEffort
-            return <button key={role.id} className={'character-card ' + role.type}
-              onClick={() => show({ type: 'role', role })} aria-label={'编辑 ' + role.name}>
-              <div className="card-halo" aria-hidden="true" /><Sparkles className="card-sparkle" size={16} aria-hidden="true" />
+  const update = (name, value) => setFields(previous => ({ ...previous, [name]: value }))
+  return <Dialog title="会话设置" close={close}>
+    <form className="stack" onSubmit={event => save(event, 'threadSettings', { threadId: thread.id, ...fields })}>
+      <ThreadFields data={data} update={update} defaultDirectory={defaultDirectory} computerAvailable={computerAvailable} onError={setError} />
+      <FormFooter error={error} close={close} label="保存设置" busy={busy || thread.busy} />
+    </form>
+  </Dialog>
+}
+
+function MembersPanel({ thread, roles, show, onView, open }) {
+  return <div className="members-shell" inert={!open}>
+    <aside id="members-panel" className="members-panel" aria-label="会话成员">
+      <button type="button" className="secondary-button add-member" onClick={() => show({ type: 'threadRoles', threadId: thread.id })}>
+        <Plus size={15} />添加成员
+      </button>
+      <div className="settings-characters">
+        {roles.map(role => {
+          const model = role.modelInfo
+          const configured = model && !model.unavailable && !model.needsEffort
+          return <div className="member-tile" key={role.id}>
+            <button className={'character-card ' + role.type}
+              onClick={() => onView({ kind: 'member', memberId: role.id, name: role.name })} aria-label={'查看 ' + role.name + ' 的任务'}>
+              <div className="card-halo" aria-hidden="true" />
               <div className="character-info"><RuntimeBadge role={role} /><strong>{role.name}</strong><span>{role.label}</span>
                 <span className="character-model" title={model?.id}>{model?.unavailable ? '所选模型不可用' : model?.label || '待选择模型'}</span>
                 {model?.needsEffort && <span className="character-effort">待选择推理强度</span>}
                 {configured && model.effort && <span className="character-effort">推理强度 {effortLabel(model.effort)}</span>}
-                <small><i className={runtime?.available && configured ? 'green-dot' : 'muted-dot'} />
-                  {running ? '回复中' : !runtime?.available ? '未找到运行时' : configured ? '就绪' : '待配置'}</small>
+                <RoleStatus role={role} />
               </div>
               <img src={art(role.type, role.form)} className={role.form} alt="" />
             </button>
-          })}
-          {!roles.length && <p className="settings-empty">暂无成员</p>}
-        </div>
-      </section>
-      <section className="settings-section" aria-label="会话笔记">
-        <div className="section-heading"><h3>会话笔记</h3></div>
-        {thread.noteFiles?.length ? <ul className="note-files">
-          {thread.noteFiles.map(file => <li key={file}>
-            <button type="button" className="note-file" title={file} onClick={() => show({ type: 'note', threadId: thread.id, file })}>
-              <FileText size={16} /><span>{file}</span>
-            </button>
-            <IconButton icon={Trash2} label={'删除 ' + file} onClick={() => show({ type: 'deleteNote', threadId: thread.id, file })} />
-          </li>)}
-        </ul> : <p className="settings-empty">暂无笔记</p>}
-      </section>
-    </div>
-  </aside>
+            <IconButton className="member-edit" icon={PencilLine} label={'编辑 ' + role.name} onClick={() => show({ type: 'role', role })} />
+          </div>
+        })}
+        {!roles.length && <p className="settings-empty">暂无成员</p>}
+      </div>
+    </aside>
+  </div>
+}
+
+function RoleStatus({ role }) {
+  const dot = role.status === 'working' || role.status === 'replying' ? 'working-dot' : role.status === 'idle' ? 'green-dot' : 'muted-dot'
+  return <small className="role-status"><i className={dot} />{roleStatus[role.status]}</small>
 }
 
 function RoleLibrary({ roles, show }) {
@@ -672,23 +934,25 @@ function RoleLibrary({ roles, show }) {
         <div className="library-art"><img src={art(role.type, role.form)} alt="" /><span className="form-pill"><Images size={13} />{role.form === 'chibi' ? 'Q 版' : '立绘'}</span></div>
         <div className="library-info"><div><strong>{role.name}</strong>
           <RoleModelBadge role={role} />
-        </div><span>{role.label}</span>
+        </div><span>{role.label}</span><RoleStatus role={role} />
           {role.personality && <p>{role.personality}</p>}</div>
       </button>)}
     </div>
   </main>
 }
 
-function Chat({ state, thread, show, command, drafts, error, toggleRoster, settingsOpen, showMembers }) {
+function Chat({ state, thread, command, drafts, error, membersOpen, contentOpen, toggleMembers, toggleContent, onView,
+  attachment, onAttachmentHandled, onAttach, taskId, onTask }) {
   const [fill, setFill] = useState(null)
-  const [taskId, setTaskId] = useState(null)
   const [replyToId, setReplyToId] = useState(null)
   const [atBottom, setAtBottom] = useState(true)
   const list = useRef(null)
   const stick = useRef(true)
+  const memberCountId = useId()
+  useEffect(() => { if (taskId) setReplyToId(null) }, [taskId])
+  const messages = thread.messages.filter(message => !message.taskId || message.status === 'done' || !message.author)
   const roles = thread.roleIds.map(id => byId(state.roles, id)).filter(Boolean)
-  const running = chatWorking(thread)
-  const HeadingIcon = roomIcons[thread.kind] || Hash
+  const HeadingIcon = roomIcons[thread.kind]
   const parent = byId(state.threads, thread.parentId)
   const anchorAuthor = parent?.messages.find(message => message.id === thread.anchorMessageId)?.author?.id
   const anchorName = byId(state.roles, anchorAuthor)?.name || thread.anchor?.name
@@ -699,20 +963,35 @@ function Chat({ state, thread, show, command, drafts, error, toggleRoster, setti
     setAtBottom(true)
   }
   useLayoutEffect(() => { if (stick.current) moveToBottom() }, [thread.messages, drafts])
-  return <main className="chat">
+  const fileDrag = event => event.dataTransfer.types.some(type => type === workspaceFileDrag || type === 'Files')
+  const dropFiles = event => {
+    if (!fileDrag(event)) return
+    event.preventDefault()
+    const path = event.dataTransfer.getData(workspaceFileDrag)
+    const paths = [...event.dataTransfer.files].map(file => api.filePath(file)).filter(Boolean)
+    if (path || paths.length) onAttach({ path, paths })
+  }
+  return <main className="chat" onDragOver={event => {
+    if (fileDrag(event)) { event.preventDefault(); event.dataTransfer.dropEffect = 'copy' }
+  }} onDrop={dropFiles}>
     <header className="chat-header">
       {parent
         ? <IconButton icon={ArrowLeft} label={'返回 ' + parent.name} onClick={() => command('select', { threadId: parent.id })} />
-        : <div className="room-icon"><HeadingIcon size={21} /></div>}
-      <div className="chat-title"><h1>{thread.name}</h1><span>{parent ? '回复线程 · ' + parent.name : '共享会话 · ' + roles.length + ' 位成员'}</span></div>
-      <div className="chat-header-tools">
-        <button type="button" className="avatar-group" aria-label="查看会话成员" onClick={showMembers} aria-controls="session-settings">
-          {roles.slice(0, 5).map(role => <Avatar key={role.id} role={role} size="tiny" />)}
-          {roles.length > 5 && <span>+{roles.length - 5}</span>}
-          {!roles.length && <UsersRound size={17} />}
+        : HeadingIcon && <div className="room-icon"><HeadingIcon size={21} /></div>}
+      <div className="chat-title">
+        <h1>{thread.name}</h1>
+        <button type="button" className="avatar-group" aria-label="查看会话成员" aria-describedby={memberCountId}
+          aria-expanded={membersOpen} onClick={toggleMembers} aria-controls="members-panel">
+          <span className="avatar-stack" aria-hidden="true">
+            {roles.slice(0, 5).map(role => <Avatar key={role.id} role={role} size="tiny" />)}
+            {!roles.length && <UsersRound size={15} />}
+          </span>
+          <span className="member-count" id={memberCountId}>{roles.length} 位成员</span>
         </button>
-        <IconButton icon={PanelRight} label={settingsOpen ? '收起会话设置' : '展开会话设置'} onClick={toggleRoster}
-          aria-expanded={settingsOpen} aria-controls="session-settings" />
+      </div>
+      <div className="chat-header-tools">
+        <IconButton icon={PanelRight} label={contentOpen ? '收起内容详情' : '展开内容详情'} onClick={toggleContent}
+          aria-expanded={contentOpen} aria-controls="content-panel" />
       </div>
     </header>
     <div className="conversation" ref={list} onScroll={e => {
@@ -721,17 +1000,16 @@ function Chat({ state, thread, show, command, drafts, error, toggleRoster, setti
       setAtBottom(stick.current)
     }}>
       {thread.anchor && <div className="thread-anchor"><Reply size={17} /><div><strong>{anchorName}</strong><p>{thread.anchor.text}</p></div></div>}
-      {thread.messages.length === 0 && <Hero thread={thread} roles={roles} onPrompt={text => setFill({ text })} />}
-      {thread.messages.length > 0 && <section className="message-list" aria-label="会话记录">
-        {thread.messages.map(message => <Message key={message.id} message={message} draft={drafts[message.id]} thread={thread} roles={state.roles}
-          onTask={task => { setReplyToId(null); setTaskId(task.id) }} openRouting={() => show({ type: 'settings' })}
-          onReply={() => { setTaskId(null); setReplyToId(message.id) }}
+      {messages.length === 0 && <Hero thread={thread} roles={roles} onPrompt={text => setFill({ text })} />}
+      {messages.length > 0 && <section className="message-list" aria-label="会话记录">
+        {messages.map(message => <Message key={message.id} message={message} draft={drafts[message.id]} thread={thread} roles={state.roles} onView={onView}
+          onReply={() => { onTask(null); setReplyToId(message.id) }}
           onInvite={roleId => command('inviteReply', { threadId: thread.id, messageId: message.id, roleId })} />)}
       </section>}
     </div>
     {!atBottom && <button type="button" className="jump-latest" onClick={moveToBottom}><ArrowDown size={15} />回到最新</button>}
-    <Composer thread={thread} roles={roles} working={running} fill={fill} error={error} command={command}
-      task={byId(thread.tasks || [], taskId)} clearTask={() => setTaskId(null)}
+    <Composer thread={thread} roles={roles} fill={fill} error={error} command={command} attachment={attachment} onAttachmentHandled={onAttachmentHandled}
+      task={byId(thread.tasks || [], taskId)} clearTask={() => onTask(null)}
       quote={byId(thread.messages, replyToId)} clearQuote={id => setReplyToId(current => current === id ? null : current)} />
   </main>
 }
@@ -745,21 +1023,36 @@ function App() {
   const [loadingError, setLoadingError] = useState('')
   const [error, setError] = useState('')
   const [drafts, setDrafts] = useState({})
+  const [activity, setActivity] = useState({})
   const [page, setPage] = useState('chat')
   const [dialog, show] = useState(null)
   const [menu, setMenu] = useState(null)
+  const [sidebarFeedback, setSidebarFeedback] = useState(null)
   const closeMenu = useCallback(() => setMenu(null), [])
+  const theme = state ? appTheme(state.settings.theme) : initialTheme
+  useLayoutEffect(() => { document.documentElement.dataset.theme = theme }, [theme])
   const [sidebar, setSidebar] = useState(false)
-  const [roster, setRoster] = useState(null)
+  const [members, setMembers] = useState(null)
+  const [panels, setPanels] = useState({})
+  const [followUp, setFollowUp] = useState(null)
+  const [contentWidth, setContentWidth] = useState(() => Number(localStorage.getItem('rainbow.contentWidth')) || null)
+  useEffect(() => {
+    if (contentWidth) localStorage.setItem('rainbow.contentWidth', String(contentWidth))
+  }, [contentWidth])
+  const [attachment, setAttachment] = useState(null)
   const [wide, setWide] = useState(() => matchMedia('(min-width: 1051px)').matches)
-  const memberSection = useRef(null)
-  const settingsOpen = roster ?? wide
+  const membersOpen = members ?? wide
   useEffect(() => {
     const query = matchMedia('(min-width: 1051px)')
     const update = event => setWide(event.matches)
     query.addEventListener('change', update)
     return () => query.removeEventListener('change', update)
   }, [])
+  useEffect(() => {
+    if (!sidebarFeedback) return
+    const timer = setTimeout(() => setSidebarFeedback(null), sidebarFeedback.error ? 5000 : 2000)
+    return () => clearTimeout(timer)
+  }, [sidebarFeedback])
   useEffect(() => {
     if (!api) { setLoadingError('请用 npm start 打开 ' + productName + ' 桌面应用。'); return }
     let alive = true
@@ -769,11 +1062,14 @@ function App() {
       setState(value)
       const running = new Set(value.threads.flatMap(thread => thread.messages.filter(message => message.status === 'running').map(message => message.id)))
       setDrafts(prev => Object.fromEntries(Object.entries(prev).filter(([id]) => running.has(id))))
+      setActivity(previous => Object.fromEntries(Object.entries(previous).filter(([id]) => running.has(id))))
     })
     const offDraft = api.onDraft(({ messageId, text }) => setDrafts(prev => ({ ...prev, [messageId]: text })))
+    const offActivity = api.onActivity(({ messageId, item }) => setActivity(previous => ({ ...previous,
+      [messageId]: { ...previous[messageId], [item.id]: item } })))
     api.snapshot().then(value => { if (alive && !received) setState(value) })
       .catch(failure => { if (alive) setLoadingError(errorText(failure)) })
-    return () => { alive = false; offChange(); offDraft() }
+    return () => { alive = false; offChange(); offDraft(); offActivity() }
   }, [])
 
   async function command(action, values) {
@@ -786,59 +1082,110 @@ function App() {
       return false
     }
   }
-  function openMenu(event, target) {
+  async function sidebarAction(action, success) {
+    try {
+      const result = await action()
+      if (success && result !== false) setSidebarFeedback({ text: success })
+    } catch (failure) {
+      setSidebarFeedback({ text: errorText(failure), error: true })
+    }
+  }
+  function openMenu(event, target, kind = 'thread') {
     event.preventDefault()
     const trigger = event.currentTarget
     const rect = trigger.getBoundingClientRect()
     const fromPointer = event.type === 'contextmenu' && (event.clientX || event.clientY)
-    setMenu({ threadId: target.id, trigger,
+    setMenu({ id: target.id, kind, trigger,
       x: fromPointer ? event.clientX : rect.left, y: fromPointer ? event.clientY : rect.bottom + 4 })
-  }
-  function showMembers() {
-    setRoster(true)
-    requestAnimationFrame(() => {
-      memberSection.current?.focus({ preventScroll: true })
-      memberSection.current?.scrollIntoView({ block: 'start' })
-    })
   }
   if (!state) return <div className="app-loading" role="status"><img src={appIcon} alt="" />{loadingError || '正在打开会话…'}</div>
   const thread = byId(state.threads, state.activeThreadId) || state.threads[0]
   const roles = thread ? thread.roleIds.map(id => byId(state.roles, id)).filter(Boolean) : []
-  const dialogThread = byId(state.threads, dialog?.threadId) || thread
+  const emptyPanel = { open: false, tabs: [], active: workspaceTabId }
+  const panel = panels[thread?.id] || emptyPanel
+  const selectTask = id => setFollowUp(id ? { threadId: thread.id, id } : null)
+  const contentOpen = panel.open
+  const updatePanel = update => setPanels(current => ({
+    ...current, [thread.id]: update(current[thread.id] || emptyPanel),
+  }))
+  const openContent = view => {
+    const key = contentKey(view)
+    const id = crypto.randomUUID()
+    updatePanel(current => {
+      const existing = current.tabs.find(tab => tab.key === key)
+      return existing ? { ...current, open: true, active: existing.id } : {
+        open: true, active: id, tabs: [...current.tabs, { id, key, view }],
+      }
+    })
+  }
+  const closeTab = id => {
+    if (panel.tabs.find(tab => tab.id === id)?.view.kind === 'browser') void api.browser('close', id)
+    updatePanel(current => {
+      const index = current.tabs.findIndex(tab => tab.id === id)
+      const tabs = current.tabs.filter(tab => tab.id !== id)
+      return { ...current, tabs, active: current.active === id ? (tabs[index] || tabs[index - 1])?.id || workspaceTabId : current.active }
+    })
+  }
+  const addAttachment = input => setAttachment({ ...input, threadId: thread.id })
+  const contentThread = contentOpen ? { ...thread, messages: thread.messages.map(message => activity[message.id]
+    ? { ...message, activity: Object.values(activity[message.id]) } : message) } : null
+  const dialogThread = dialog?.threadId ? byId(state.threads, dialog.threadId) : thread
+  const dialogGroup = byId(state.threadGroups, dialog?.groupId)
+  const menuThread = menu?.kind === 'thread' && byId(state.threads, menu.id)
   const close = () => show(null)
   return <div className="app">
     <header className="titlebar">
       <button type="button" className="icon-button titlebar-nav" aria-label="切换会话导航" onClick={() => setSidebar(!sidebar)}><PanelLeft size={18} /></button>
-      <div className="desktop-brand"><img src={appIcon} alt="" /><strong>{productName}</strong></div>
       <div className="titlebar-actions">
-        <IconButton icon={Settings} label="运行时设置" onClick={() => show({ type: 'settings' })} />
+        <IconButton icon={Settings} label="设置" onClick={() => show({ type: 'settings' })} />
       </div>
     </header>
-    <div className={'workspace ' + (sidebar ? 'sidebar-open ' : '') + (roster === true ? 'roster-open ' : roster === false ? 'roster-hidden ' : '') + (page === 'roles' || !thread ? 'roles-page' : '')}>
+    <div style={contentWidth ? { '--preferred-content-width': contentWidth + 'px' } : undefined}
+      className={'workspace ' + (sidebar ? 'sidebar-open ' : '') + (membersOpen && page === 'chat' && thread ? 'members-open ' : '') + (contentOpen && page === 'chat' ? 'content-open' : '')}>
       {sidebar && <button className="sidebar-scrim" aria-label="关闭会话导航" onClick={() => setSidebar(false)} />}
-      <SideBar state={state} page={page} navigate={setPage} show={show} command={command} openMenu={openMenu} close={() => setSidebar(false)} />
+      <SideBar state={state} page={page} navigate={setPage} show={show} command={command} sidebarAction={sidebarAction}
+        openMenu={openMenu} close={() => setSidebar(false)} />
       {page === 'roles' ? <RoleLibrary roles={state.roles} show={show} /> : thread ? <React.Fragment key={thread.id}>
-        <Chat state={state} thread={thread} show={show} command={command} drafts={drafts} error={error}
-          settingsOpen={settingsOpen} showMembers={showMembers} toggleRoster={() => setRoster(!settingsOpen)} />
-        <SessionSettings thread={thread} roles={roles} runtimes={state.runtimes} defaultDirectory={state.defaultDirectory}
-          memberSection={memberSection} show={show} close={() => setRoster(false)} />
+        <Chat state={state} thread={thread} command={command} drafts={drafts} error={error} onView={openContent}
+          membersOpen={membersOpen} contentOpen={contentOpen} toggleMembers={() => setMembers(!membersOpen)}
+          toggleContent={() => updatePanel(current => ({ ...current, open: !current.open }))}
+          attachment={attachment?.threadId === thread.id ? attachment : null} onAttach={addAttachment}
+          taskId={followUp?.threadId === thread.id ? followUp.id : null} onTask={selectTask}
+          onAttachmentHandled={request => setAttachment(current => current === request ? null : current)} />
+        <MembersPanel thread={thread} roles={roles} show={show} onView={openContent} open={membersOpen} />
+        {contentOpen && <ContentPanel thread={contentThread} roles={state.roles} drafts={drafts} tabs={panel.tabs}
+          active={panel.active} onSelect={id => updatePanel(current => ({ ...current, active: id }))} onView={openContent} onTabClose={closeTab} onTask={selectTask}
+          suspended={Boolean(dialog || menu || sidebar)} onNoteDelete={file => show({ type: 'deleteNote', threadId: thread.id, file })}
+          onReference={path => addAttachment({ path })} onResize={width => setContentWidth(Math.max(240, Math.min(innerWidth, Math.round(width))))} />}
       </React.Fragment> : <main className="empty-conversations"><MessageSquare size={27} /><h1>还没有会话</h1>
         <button className="primary-button" onClick={() => show({ type: 'room' })}><Plus size={16} />新建会话</button></main>}
     </div>
-    {menu && <ThreadContextMenu menu={menu} close={closeMenu} choose={type => {
-      show({ type, threadId: menu.threadId })
+    {sidebarFeedback && <div className={'sidebar-feedback' + (sidebarFeedback.error ? ' failed' : '')}
+      role={sidebarFeedback.error ? 'alert' : 'status'}>{sidebarFeedback.text}</div>}
+    {menu && <SidebarContextMenu menu={menu} close={closeMenu} canMove={menuThread && !menuThread.parentId && state.threadGroups.length > 1} choose={type => {
       closeMenu()
+      if (type === 'copyThreadId') {
+        void sidebarAction(() => api.copyThreadId(menu.id), '已复制会话 ID')
+        menu.trigger?.focus({ preventScroll: true })
+      } else if (type === 'exportThread') {
+        void sidebarAction(() => api.exportThread(menu.id), '会话已导出')
+      } else show({ type, ...(menu.kind === 'group' ? { groupId: menu.id } : { threadId: menu.id }) })
     }} />}
     {dialog?.type === 'role' && <RoleDialog role={dialog.role} close={close} />}
     {dialog?.type === 'settings' && <SettingsDialog settings={state.settings} runtimes={state.runtimes} close={close} />}
+    {dialog?.type === 'newGroup' && <GroupNameDialog close={close} />}
+    {dialog?.type === 'renameGroup' && dialogGroup && <GroupNameDialog group={dialogGroup} close={close} />}
+    {dialog?.type === 'deleteGroup' && dialogGroup && <DeleteGroupDialog group={dialogGroup} close={close} />}
+    {dialog?.type === 'moveThread' && dialogThread && <MoveThreadDialog thread={dialogThread} groups={state.threadGroups} close={close} />}
     {dialog?.type === 'renameThread' && dialogThread && <RenameThreadDialog thread={dialogThread} close={close} />}
     {dialog?.type === 'deleteThread' && dialogThread && <DeleteThreadDialog thread={dialogThread} close={close}
       hasReplies={state.threads.some(item => item.parentId === dialogThread.id)} />}
+    {dialog?.type === 'sessionSettings' && dialogThread && <SessionSettings thread={dialogThread} defaultDirectory={state.defaultDirectory}
+      computerAvailable={state.computerAvailable} close={close} />}
     {dialog?.type === 'threadRoles' && dialogThread && <ThreadMembersDialog thread={dialogThread} roles={state.roles} close={close} />}
-    {dialog?.type === 'note' && dialogThread && <NoteDialog thread={dialogThread} file={dialog.file} close={close} />}
     {dialog?.type === 'deleteNote' && dialogThread && <DeleteNoteDialog thread={dialogThread} file={dialog.file} close={close} />}
     {dialog?.type === 'room' && <ThreadDialog roles={state.roles} defaultDirectory={state.defaultDirectory}
-      close={close} onSaved={() => { close(); setPage('chat') }} />}
+      computerAvailable={state.computerAvailable} close={close} onSaved={() => { close(); setPage('chat') }} />}
   </div>
 }
 

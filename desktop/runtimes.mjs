@@ -1,10 +1,13 @@
-import { accessSync, constants } from 'node:fs'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { accessSync, constants, existsSync } from 'node:fs'
+import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { delimiter, isAbsolute, join } from 'node:path'
 import { execFile, spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import { promisify } from 'node:util'
+import { setTimeout as delay } from 'node:timers/promises'
+import { runCodex } from './codex-server.mjs'
+import { dshActivity } from './activity.mjs'
 
 export const runtimeNames = { codex: 'Codex', deepseek: 'DeepSeek Harness' }
 
@@ -35,39 +38,21 @@ export function findRuntime(type, configuredPath) {
   })
 }
 
-export function runtimeArgs(type, { sessionId, writeAccess, model, effort, modelPatch, ephemeral, outputSchema }) {
+export function dshArgs({ sessionId, writeAccess, modelPatch }) {
   const mode = writeAccess ? 'workspace-write' : 'read-only'
-  if (type === 'deepseek') {
-    return ['--profile', 'headless', ...(modelPatch ? ['--patch', modelPatch] : []), '--json', '--permission-mode', mode, '--approval-policy', 'never',
-      ...(sessionId ? ['--session-id', sessionId] : []), '-']
-  }
-  const common = ['--json', '--ignore-user-config', '--skip-git-repo-check', '-c', 'approval_policy="never"',
-    ...(model ? ['-m', model] : []), ...(effort ? ['-c', 'model_reasoning_effort=' + JSON.stringify(effort)] : [])]
-  return sessionId
-    ? ['exec', 'resume', ...common, '-c', 'sandbox_mode="' + mode + '"', sessionId, '-']
-    : ['exec', ...common, '--sandbox', mode, ...(ephemeral ? ['--ephemeral'] : []),
-      ...(outputSchema ? ['--output-schema', outputSchema] : []), '-']
+  return ['--profile', 'headless', ...(modelPatch ? ['--patch', modelPatch] : []), '--json', '--permission-mode', mode, '--approval-policy', 'never',
+    ...(sessionId ? ['--session-id', sessionId] : []), '-']
 }
 
-export function parseEvent(type, event) {
-  if (type === 'deepseek') {
-    if (event.type === 'session') return { sessionId: event.sessionId }
-    if (event.type === 'text') return { draft: event.text }
-    if (event.type === 'final') {
-      return {
-        sessionId: event.sessionId,
-        answer: event.text,
-        error: event.reason?.kind === 'completed' ? undefined
-          : event.reason?.message || event.message || 'DSH 结束了本轮执行（' + (event.reason?.kind || '未知状态') + '）',
-      }
-    }
-    if (event.type === 'error') return { warning: event.message || event.error?.message }
-    return {}
+export function parseDshEvent(event) {
+  if (event.type === 'session') return { sessionId: event.sessionId }
+  if (event.type === 'text') return { draft: event.text }
+  if (event.type === 'final') {
+    return { sessionId: event.sessionId, answer: event.text,
+      error: event.reason?.kind === 'completed' ? undefined
+        : event.reason?.message || event.message || 'DSH 结束了本轮执行（' + (event.reason?.kind || '未知状态') + '）' }
   }
-  if (event.type === 'thread.started') return { sessionId: event.thread_id }
-  if (event.type === 'item.completed' && event.item?.type === 'agent_message') return { answer: event.item.text, draft: event.item.text }
-  if (event.type === 'turn.failed') return { error: event.error?.message || 'Codex 本轮执行失败。' }
-  if (event.type === 'error') return { warning: event.message }
+  if (event.type === 'error') return { warning: event.message || event.error?.message }
   return {}
 }
 
@@ -93,23 +78,50 @@ export async function runRuntime(options) {
   if (!binary) throw new Error('未找到 ' + runtimeNames[type] + '。请在运行时设置中选择可执行文件。')
   if (!model) throw new Error('请先为角色选择模型版本。')
   if (signal.aborted) throw new Error('已停止')
-  if (type !== 'deepseek') return runChild(options, runtimeArgs(type, options))
+  if (type === 'codex') return runCodex({ ...options, env: runtimeEnv() })
 
   const provider = options.provider || await readDshProvider(binary, cwd, signal).catch(() => null)
   if (!provider) throw new Error(signal.aborted ? '已停止' : '无法读取 DSH headless 配置的模型提供方。')
   const folder = await mkdtemp(join(tmpdir(), 'rainbow-dsh-model-'))
+  const deliveries = new Set()
+  let stopped = false, sequence = 0
   try {
     const modelPatch = join(folder, 'model.yml')
-    await writeFile(modelPatch, JSON.stringify([{ id: 'agent-default-model', config: {
+    const patches = [{ id: 'agent-default-model', config: {
       provider, model, ...(effort ? { reasoningEffort: effort } : {}),
-    } }]), { mode: 0o600 })
-    return await runChild(options, runtimeArgs(type, { ...options, modelPatch }))
+    } }]
+    if (options.computerUrl) patches.push({ insert: [{ id: 'rainbow-computer', name: '@deepseek-ai/dsh-mcp-client', config: {
+      serverName: 'rainbow_computer', transport: 'streamable-http', url: options.computerUrl,
+      failOnStartupError: true, reconnect: { enabled: false },
+    } }] })
+    if (options.onSteer) {
+      const plugin = join(folder, 'steering.mjs')
+      await writeFile(plugin, await readFile(new URL('./dsh-steering.mjs', import.meta.url)), { mode: 0o600 })
+      patches.push({ insert: [{ id: 'rainbow-task-steering', name: plugin, config: { directory: folder } }] })
+    }
+    await writeFile(modelPatch, JSON.stringify(patches), { mode: 0o600 })
+    options.onSteer?.((text, id) => {
+      const delivery = (async () => {
+        const path = join(folder, 'steer-' + String(++sequence).padStart(8, '0'))
+        await writeFile(path + '.tmp', JSON.stringify({ id, text }), { mode: 0o600, flag: 'wx' })
+        await rename(path + '.tmp', path)
+        const ack = join(folder, 'ack-' + id)
+        while (!stopped && !signal.aborted && !existsSync(ack)) await delay(100)
+        return existsSync(ack)
+      })()
+      deliveries.add(delivery)
+      void delivery.catch(() => {}).finally(() => deliveries.delete(delivery))
+      return delivery
+    })
+    return await runDsh(options, dshArgs({ ...options, modelPatch }))
   } finally {
+    stopped = true
+    await Promise.allSettled(deliveries)
     await rm(folder, { recursive: true, force: true })
   }
 }
 
-function runChild({ type, binary, cwd, sessionId, prompt, signal, onDraft, timeoutMs = 15 * 60_000 }, args) {
+function runDsh({ binary, cwd, sessionId, prompt, signal, onDraft, onActivity, timeoutMs = 15 * 60_000 }, args) {
   if (signal.aborted) return Promise.reject(new Error('已停止'))
   return new Promise((resolve, reject) => {
     const group = process.platform !== 'win32'
@@ -117,6 +129,7 @@ function runChild({ type, binary, cwd, sessionId, prompt, signal, onDraft, timeo
       cwd, env: runtimeEnv(), detached: group, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
     })
     let error = '', warning = '', stderr = '', answer = '', currentId = sessionId
+    let pendingText = '', textSequence = 0
     let timeout, forcedStop
     let timedOut = false, sawRunEvent = false
     const terminate = signalName => {
@@ -140,12 +153,23 @@ function runChild({ type, binary, cwd, sessionId, prompt, signal, onDraft, timeo
       let event
       try { event = JSON.parse(line) } catch { return }
       if (event?.type !== 'error') sawRunEvent = true
-      const result = parseEvent(type, event)
+      const result = parseDshEvent(event)
       if (typeof result.sessionId === 'string') currentId = result.sessionId
       if (typeof result.answer === 'string') answer = result.answer
       if (typeof result.error === 'string') error = result.error
       if (typeof result.warning === 'string') warning = result.warning
-      if (typeof result.draft === 'string') onDraft?.(result.draft)
+      if (typeof result.draft === 'string') {
+        onDraft?.(result.draft)
+        pendingText = (pendingText + result.draft).slice(-5000)
+      }
+      const activity = dshActivity(event)
+      if (activity) {
+        if (event.type === 'tool_call' && pendingText) {
+          onActivity?.({ id: 'text-' + ++textSequence, kind: 'text', status: 'completed', text: pendingText })
+          pendingText = ''
+        }
+        onActivity?.(activity)
+      }
     })
     child.stderr.setEncoding('utf8').on('data', chunk => { stderr = (stderr + chunk).slice(-6000) })
     child.stdin.on('error', () => {})
@@ -156,12 +180,14 @@ function runChild({ type, binary, cwd, sessionId, prompt, signal, onDraft, timeo
       signal.removeEventListener('abort', stop)
       lines.close()
       if (signal.aborted) return reject(new Error('已停止'))
-      if (timedOut) return reject(new Error('本轮达到 ' + Math.round(timeoutMs / 1000) + ' 秒执行上限。'))
+      if (timedOut) {
+        const failure = new Error('本轮达到 ' + Math.round(timeoutMs / 1000) + ' 秒执行上限。')
+        failure.code = 'RDS_RUNTIME_TIMEOUT'
+        return reject(failure)
+      }
       if (error || code !== 0 || !answer.trim()) {
         const failure = new Error(cleanError(error || warning || stderr))
-        if (sessionId && code !== 0 && !sawRunEvent && (type === 'deepseek'
-          ? warning === 'session ' + JSON.stringify(sessionId) + ' does not exist; omit --session-id to start a new Session'
-          : stderr.split('\n').some(line => line.trim() === 'Error: thread/resume: thread/resume failed: no rollout found for thread id ' + sessionId + ' (code -32600)'))) {
+        if (sessionId && code !== 0 && !sawRunEvent && warning === 'session ' + JSON.stringify(sessionId) + ' does not exist; omit --session-id to start a new Session') {
           failure.code = 'RDS_SESSION_MISSING'
         }
         return reject(failure)
