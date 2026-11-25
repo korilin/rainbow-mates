@@ -8,6 +8,7 @@ const subscribe = (name, fn) => {
 contextBridge.exposeInMainWorld('rainbow', {
   snapshot: () => ipcRenderer.invoke('rainbow:snapshot'),
   pickAvatar: () => ipcRenderer.invoke('rainbow:profile-pick-avatar'),
+  saveSettings: settings => ipcRenderer.invoke('rainbow:settings-save', settings),
   saveProfile: profile => ipcRenderer.invoke('rainbow:profile-save', profile),
   run: (action, input) => ipcRenderer.invoke('rainbow:run', action, input),
   copyThreadId: threadId => ipcRenderer.invoke('rainbow:copy-thread-id', threadId),

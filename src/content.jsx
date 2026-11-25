@@ -1,7 +1,7 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { ArrowLeft, ArrowRight, ClipboardList, CodeXml, Download, FileImage, FileText, Folder, Globe, Paperclip, Plus, RefreshCw, Trash2, X } from 'lucide-react'
+import { ArrowLeft, ArrowRight, ClipboardList, CodeXml, Download, FileImage, FileText, Folder, Globe, Paperclip, Plus, RefreshCw, X } from 'lucide-react'
 import { assetURL, linkDestination, mediaType, websiteURL } from '../shared/content-links.mjs'
 
 import { fileIcon } from './file-icon.jsx'
@@ -25,7 +25,6 @@ export function contentKey(view) {
     case 'diff': return JSON.stringify(['diff', view.messageId, view.itemId, view.filePath])
     case 'browser': return JSON.stringify(['browser', view.url || ''])
     case 'workspace': return JSON.stringify(['workspace', view.path])
-    case 'note': return JSON.stringify(['note', view.file])
     case 'member': return JSON.stringify(['member', view.memberId])
     case 'task': return JSON.stringify(['task', view.taskId, view.memberId])
   }
@@ -176,26 +175,6 @@ function FileContent({ threadId, view, onView, onReference }) {
   </div>
 }
 
-function NoteContent({ thread, file, onView, onDelete, onClose }) {
-  const available = thread.noteFiles?.includes(file)
-  const [state, setState] = useState({})
-  useEffect(() => {
-    if (!available) return
-    let live = true
-    api.run('readNote', { threadId: thread.id, file }).then(text => { if (live) setState({ text }) })
-      .catch(error => { if (live) setState({ error: errorText(error) }) })
-    return () => { live = false }
-  }, [thread.id, file, available, thread.activityAt])
-  return <div className="content-body">
-    <div className="content-document-heading"><strong>{file}</strong>
-      {available && <button type="button" className="icon-button" aria-label={'删除 ' + file} onClick={() => onDelete(file)}><Trash2 size={15} /></button>}</div>
-    {!available ? <p className="content-empty">笔记已删除。 <button type="button" className="content-link" onClick={onClose}>关闭标签页</button></p>
-      : state.error ? <p className="content-error" role="alert">{state.error}</p>
-      : state.text === undefined ? <p className="content-empty" role="status">正在读取笔记…</p>
-      : <div className="bubble"><ContentMarkdown text={state.text} onView={onView} /></div>}
-  </div>
-}
-
 const diffView = (messageId, item, file) => ({ kind: 'diff', messageId, itemId: item.id, filePath: file.path })
 function DiffContent({ thread, view }) {
   const message = find(thread.messages, view.messageId)
@@ -316,9 +295,6 @@ function ContentPicker({ thread, roles, onView }) {
         <button type="button" onClick={() => onView({ kind: 'member', memberId: role.id, name: role.name })}><ClipboardList size={15} /><span>{role.name}</span></button>
       </li>)}
     </ul></details>}
-    {thread.noteFiles?.length > 0 && <details open><summary>会话笔记</summary><ul className="content-list">
-      {thread.noteFiles.map(file => <li key={file}><button type="button" onClick={() => onView({ kind: 'note', file })}><FileText size={15} /><span>{file}</span></button></li>)}
-    </ul></details>}
     {files.length > 0 && <details open><summary>消息附件</summary><ul className="content-list">
       {files.map(({ messageId, item }) => <li key={messageId + ':' + item.id}>
         <button type="button" title={item.path} onClick={() => onView(targetAsset(messageId, item))}><FileText size={15} /><span>{item.name}</span></button></li>)}
@@ -335,7 +311,6 @@ function tabTitle(view, thread, roles) {
     case 'asset': return view.item.path?.split('/').at(-1) || view.item.name
     case 'diff': return view.filePath.split('/').at(-1) + ' · 改动'
     case 'browser': return view.name || (view.url ? new URL(view.url).host : '网页')
-    case 'note': return view.file
     case 'member': return (find(roles, view.memberId)?.name || view.name) + ' · 任务'
     case 'task': {
       const title = find(thread.tasks, view.taskId)?.title || view.name
@@ -345,7 +320,7 @@ function tabTitle(view, thread, roles) {
   }
 }
 
-export function ContentPanel({ thread, roles, drafts, tabs, active, onSelect, onView, onTabClose, onNoteDelete, onReference, onResize, onTask, suspended }) {
+export function ContentPanel({ thread, roles, drafts, tabs, active, onSelect, onView, onTabClose, onReference, onResize, onTask, suspended }) {
   const [menu, setMenu] = useState(null)
   const strip = useRef(null)
   const panel = useRef(null)
@@ -448,8 +423,6 @@ export function ContentPanel({ thread, roles, drafts, tabs, active, onSelect, on
         {!view && !workspaceActive && <ContentPicker thread={thread} roles={roles} onView={onView} />}
         {view?.kind === 'browser' && <BrowserContent key={tab.id} tabId={tab.id} initialUrl={view.url} suspended={suspended || resizing || Boolean(menu)} />}
         {(view?.kind === 'asset' || view?.kind === 'workspace') && <FileContent key={tab.id} threadId={thread.id} view={view} onView={onView} onReference={onReference} />}
-        {view?.kind === 'note' && <NoteContent key={tab.id} thread={thread} file={view.file} onView={onView}
-          onDelete={onNoteDelete} onClose={() => close(tab.id)} />}
         {view?.kind === 'diff' && <DiffContent thread={thread} view={view} />}
         {view?.kind === 'member' && <MemberContent key={tab.id} thread={thread} view={view} roles={roles} drafts={drafts} onView={onView} onTask={onTask} />}
         {view?.kind === 'task' && <TaskContent thread={thread} view={view} roles={roles} drafts={drafts} onView={onView} onTask={onTask} />}

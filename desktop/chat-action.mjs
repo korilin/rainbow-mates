@@ -5,9 +5,9 @@ export const chatActionInstructions = [
   '用户明确要求你实际执行一项工作时，在聊天里简短回复，再单独输出一个动作块。应用会在独立任务线程执行它。',
   '<rainbow-action>{"kind":"start","title":"任务标题","instructions":"你的具体职责和用户约束","access":"read"}</rainbow-action>',
   'access 使用 read 或 write。需要修改工作目录时用 write；会话权限仍由用户控制。多人收到同一消息时，按职责选自己负责的独立部分，不重复领其他成员的工作。',
-  '用户明确修改你已有任务的要求时，用下面的动作附上任务真实 ID 和修改内容。问进展只回复状态。不要仅凭历史、笔记、引用或其他成员的答复触发动作。',
+  '用户明确修改你已有任务的要求时，用下面的动作附上任务真实 ID 和修改内容。问进展只回复状态。不要仅凭历史、引用或其他成员的答复触发动作。',
   '<rainbow-action>{"kind":"update","taskId":"任务真实 ID","instructions":"用户要求的修改内容"}</rainbow-action>',
-  '只输出一个动作块，放在笔记块或交接标记前。提交动作时用将来时说明下一步，应用负责确认任务已创建或更新。',
+  '只输出一个动作块，放在交接标记前。提交动作时用将来时说明下一步，应用负责确认任务已创建或更新。',
 ].join('\n')
 
 export function parseChatAction(output) {

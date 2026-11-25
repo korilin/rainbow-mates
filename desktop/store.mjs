@@ -6,6 +6,8 @@ import { DEFAULT_THREAD_GROUP } from '../shared/thread-groups.mjs'
 export function seed() {
   return {
     version: 1,
+    notesRemoved: true,
+    localProfileId: randomUUID(),
     settings: { codexPath: '', deepseekPath: '' },
     threadGroups: [{ id: DEFAULT_THREAD_GROUP, name: '默认分组' }],
     roles: [
@@ -27,9 +29,30 @@ export class Store {
     this.value = existsSync(filename) ? JSON.parse(readFileSync(filename, 'utf8')) : seed()
     if (this.value.version !== 1) throw new Error('本地数据版本不受支持。')
     let recovered = false
+    if (!this.value.localProfileId) {
+      this.value.localProfileId = randomUUID()
+      recovered = true
+    }
     for (const key of ['codexModel', 'deepseekModel', 'routing']) {
       if (!Object.hasOwn(this.value.settings, key)) continue
       delete this.value.settings[key]
+      recovered = true
+    }
+    if (!this.value.notesRemoved) {
+      delete this.value.chatSessions
+      for (const thread of this.value.threads) {
+        thread.sessions = {}
+        for (const message of thread.messages) {
+          delete message.noteRefs
+          delete message.noteError
+          if (message.author && message.text) message.text = message.text.replace(/(?:^|\n)<rainbow-notes>[\s\S]*?(?:<\/rainbow-notes>|$)/gu, '').trimEnd()
+        }
+        for (const task of thread.tasks || []) {
+          delete task.noteRefs
+          task.sessions = {}
+        }
+      }
+      this.value.notesRemoved = true
       recovered = true
     }
     const defaults = seed()
@@ -82,6 +105,7 @@ export class Store {
       for (const task of thread.tasks || []) {
         if (!['queued', 'running'].includes(task.status)) continue
         task.status = 'stopped'
+        if (task.checkpoint?.outcome === 'running') task.checkpoint.outcome = 'interrupted'
         recovered = true
       }
       if (!Number.isSafeInteger(thread.messageSeq)) {

@@ -40,7 +40,7 @@ function avatarBytes(value) {
   return image.toPNG()
 }
 
-export function saveUserProfile(conversations, directory, { name, avatar }) {
+export function saveUserProfile(conversations, directory, { name, avatar }, runtimeSettings) {
   if (typeof name !== 'string' || name.length > 36 || /[\u0000-\u001f\u007f]/u.test(name)) throw new Error('显示名最多 36 个字符。')
   const previous = conversations.store.value.settings.profile?.avatarId
   let avatarId = previous
@@ -54,7 +54,10 @@ export function saveUserProfile(conversations, directory, { name, avatar }) {
     writeFileSync(added, bytes, { flag: 'wx', mode: 0o600 })
   }
   try {
-    conversations.change(state => { state.settings.profile = { name: name.trim(), ...(avatarId && { avatarId }) } })
+    conversations.change(state => {
+      state.settings.profile = { name: name.trim(), ...(avatarId && { avatarId }) }
+      if (runtimeSettings) Object.assign(state.settings, runtimeSettings)
+    })
   } catch (error) {
     if (added) rmSync(added, { force: true })
     throw error

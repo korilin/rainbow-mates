@@ -11,6 +11,8 @@ import { Conversations } from './conversations.mjs'
 import { ComputerBridge } from './computer.mjs'
 import { createMacDesktop } from './computer-macos.mjs'
 import { closeCodexServers } from './codex-server.mjs'
+import { RoleMemory } from './memory/service.mjs'
+import { cachedModel, modelDirectory } from './memory/encoder.mjs'
 import { displayVersion } from './app-version.mjs'
 import { References } from './references.mjs'
 import { readAssetPreview, streamAsset } from './content.mjs'
@@ -120,7 +122,7 @@ else {
     if (window.isMinimized()) window.restore()
     window.focus()
   })
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     app.setAboutPanelOptions({ applicationName: metadata.productName, applicationVersion: displayVersion })
     if (!app.isPackaged) app.dock?.setIcon(icon)
     const data = app.getPath('userData')
@@ -129,9 +131,18 @@ else {
     const computer = new ComputerBridge(createMacDesktop())
     const references = new References()
     mkdirSync(work, { recursive: true, mode: 0o700 })
+    let memory
+    let memoryStartupError
     try {
+      memory = new RoleMemory({
+        filename: join(data, 'memory.sqlite'),
+        modelDirectory: app.isPackaged ? join(process.resourcesPath, modelDirectory) : cachedModel(),
+      })
+    } catch (error) { memoryStartupError = error.message }
+    try {
+      await rm(join(data, 'notes'), { recursive: true, force: true })
       conversations = new Conversations({
-        store: new Store(join(data, 'workspace.json')), defaultDirectory: work, computer, references,
+        store: new Store(join(data, 'workspace.json')), defaultDirectory: work, computer, references, memory, memoryStartupError,
         publish: value => {
           applyTheme(appTheme(value.settings.theme))
           notify('rainbow:state', withAppVersion(value))
@@ -171,6 +182,14 @@ else {
       return result.canceled || !result.filePaths[0] ? null : previewUserAvatar(result.filePaths[0])
     }))
     ipcMain.handle('rainbow:profile-save', guard(profile => saveUserProfile(conversations, profileDirectory, profile)))
+    ipcMain.handle('rainbow:settings-save', guard(({ profile, codexPath, deepseekPath }) => {
+      if (typeof codexPath !== 'string' || typeof deepseekPath !== 'string'
+        || codexPath.length > 4096 || deepseekPath.length > 4096) throw new Error('运行时路径无效。')
+      saveUserProfile(conversations, profileDirectory, profile, {
+        codexPath: codexPath.trim(), deepseekPath: deepseekPath.trim(),
+      })
+      conversations.refreshModels()
+    }))
     ipcMain.handle('rainbow:content-asset', guard(async (threadId, messageId, id) =>
       readAssetPreview(await conversations.messageAsset(threadId, messageId, id))))
     ipcMain.handle('rainbow:content-save', guard(saveAttachment))
@@ -230,10 +249,13 @@ else {
     ]))
     openWindow()
     conversations.refreshModels()
+    void memory?.start()
+    memory?.tick()
     app.on('activate', () => { if (!window) openWindow() })
   })
   app.on('before-quit', () => {
     conversations?.stopAll()
+    conversations?.memory?.close()
     closeCodexServers()
   })
   app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })

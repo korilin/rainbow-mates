@@ -90,9 +90,16 @@ export async function runRuntime(options) {
     const patches = [{ id: 'agent-default-model', config: {
       provider, model, ...(effort ? { reasoningEffort: effort } : {}),
     } }]
+    if (options.ephemeral || options.sessionRoot) {
+      patches.push({ id: 'session-persistence-jsonl', config: { root: options.sessionRoot || join(folder, 'sessions') } })
+    }
     if (options.computerUrl) patches.push({ insert: [{ id: 'rainbow-computer', name: '@deepseek-ai/dsh-mcp-client', config: {
       serverName: 'rainbow_computer', transport: 'streamable-http', url: options.computerUrl,
       failOnStartupError: true, reconnect: { enabled: false },
+    } }] })
+    if (options.memoryUrl) patches.push({ insert: [{ id: 'rainbow-memory', name: '@deepseek-ai/dsh-mcp-client', config: {
+      serverName: 'rainbow_memory', transport: 'streamable-http', url: options.memoryUrl,
+      failOnStartupError: false, reconnect: { enabled: false },
     } }] })
     if (options.onSteer) {
       const plugin = join(folder, 'steering.mjs')
@@ -121,7 +128,7 @@ export async function runRuntime(options) {
   }
 }
 
-function runDsh({ binary, cwd, sessionId, prompt, signal, onDraft, onActivity, timeoutMs = 15 * 60_000 }, args) {
+function runDsh({ binary, cwd, sessionId, prompt, signal, onDraft, onActivity, onDelivered, onToolResult, timeoutMs = 15 * 60_000 }, args) {
   if (signal.aborted) return Promise.reject(new Error('已停止'))
   return new Promise((resolve, reject) => {
     const group = process.platform !== 'win32'
@@ -131,7 +138,8 @@ function runDsh({ binary, cwd, sessionId, prompt, signal, onDraft, onActivity, t
     let error = '', warning = '', stderr = '', answer = '', currentId = sessionId
     let pendingText = '', textSequence = 0
     let timeout, forcedStop
-    let timedOut = false, sawRunEvent = false
+    let timedOut = false, sawRunEvent = false, delivered = false
+    const toolNames = new Map()
     const terminate = signalName => {
       try {
         if (group && child.pid) process.kill(-child.pid, signalName)
@@ -155,6 +163,16 @@ function runDsh({ binary, cwd, sessionId, prompt, signal, onDraft, onActivity, t
       if (event?.type !== 'error') sawRunEvent = true
       const result = parseDshEvent(event)
       if (typeof result.sessionId === 'string') currentId = result.sessionId
+      if (!delivered && ['text', 'tool_call', 'tool_result', 'final'].includes(event.type) && !result.error) {
+        delivered = true
+        onDelivered?.(currentId)
+      }
+      if (event.type === 'tool_call' && event.callId && toolNames.size < 96) toolNames.set(event.callId, event.tool)
+      if (event.type === 'tool_result' && event.callId) {
+        const name = toolNames.get(event.callId)
+        if (!name?.includes('memory_search')) onToolResult?.(event.callId, { ...event, tool: name })
+        toolNames.delete(event.callId)
+      }
       if (typeof result.answer === 'string') answer = result.answer
       if (typeof result.error === 'string') error = result.error
       if (typeof result.warning === 'string') warning = result.warning
@@ -190,6 +208,10 @@ function runDsh({ binary, cwd, sessionId, prompt, signal, onDraft, onActivity, t
         if (sessionId && code !== 0 && !sawRunEvent && warning === 'session ' + JSON.stringify(sessionId) + ' does not exist; omit --session-id to start a new Session') {
           failure.code = 'RDS_SESSION_MISSING'
         }
+        if (sessionId && /session.{0,120}(?:occupied|busy|active writer|already active)|another active run/i.test(failure.message)) {
+          failure.code = 'RDS_SESSION_BUSY'
+        }
+        if (/context.window|context length|maximum context/i.test(failure.message)) failure.code = 'RDS_CONTEXT_LIMIT'
         return reject(failure)
       }
       resolve({ text: answer.trim(), sessionId: currentId })

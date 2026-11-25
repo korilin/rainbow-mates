@@ -1,18 +1,23 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { existsSync, realpathSync, statSync } from 'node:fs'
 import { dirname, isAbsolute, join, relative, sep } from 'node:path'
 import { findRuntime, runRuntime, runtimeNames } from './runtimes.mjs'
 import { messageArtifacts, resolveAsset } from './content.mjs'
 import { readRuntimeCatalog } from './models.mjs'
-import { Notes, noteInstructions, parseNoteReply, visibleDraft } from './notes.mjs'
 import { chatActionInstructions, parseChatAction, visibleChatDraft } from './chat-action.mjs'
 import { directedMembers, findMentions } from '../shared/mentions.mjs'
 import { inlineReferenceKinds, matchesInlineReference, referenceLimit } from '../shared/composer-references.mjs'
 import { DEFAULT_THREAD_GROUP } from '../shared/thread-groups.mjs'
 import { referenceContext, runtimeReferences } from './references.mjs'
+import { checkpointInstructions, hideMemoryDraft, memoryInstructions, parseMemoryReply } from './memory/protocol.mjs'
+import { checkpointContext, taskCheckpoint } from './memory/checkpoints.mjs'
 
 const MESSAGE_LIMIT = 24_000
 const AUTO_HANDOFF_LIMIT = 2
+const CHAT_IDLE_MS = 4 * 60 * 60_000
+const executeFile = promisify(execFile)
 const clean = (value, limit) => typeof value === 'string' ? value.trim().slice(0, limit) : ''
 const required = (value, limit, field) => {
   const text = clean(value, limit)
@@ -91,9 +96,22 @@ function stamp(state, thread, message) {
 }
 
 const visibleMessage = message => !message.background || ['done', 'error'].includes(message.status)
+const inFlight = message => message.status === 'queued' || message.status === 'running'
+
+function messageTimeline(messages) {
+  const timeline = messages.toSorted((a, b) => Number(inFlight(a)) - Number(inFlight(b)) || a.at - b.at)
+  // Older records and errors can lack a sequence. Keep their time-based positions.
+  const published = timeline.filter(message => message.seq != null).sort((a, b) => a.seq - b.seq)
+  let index = 0
+  return timeline.map(message => message.seq == null ? message : published[index++])
+}
+
+const stripLegacyNotes = text => text.replace(/(?:^|\n)<rainbow-notes>[\s\S]*?(?:<\/rainbow-notes>|$)/gu, '').trimEnd()
+
 function publicMessage(message) {
   const artifacts = messageArtifacts(message)
-  return { ...message, ...(artifacts.length ? { artifacts } : {}),
+  const text = message.status === 'done' ? stripLegacyNotes(message.text || '') : message.text
+  return { ...message, text, ...(artifacts.length ? { artifacts } : {}),
     ...(message.references && { references: message.references.map(({ excerpt, truncated, ...reference }) => reference) }) }
 }
 
@@ -118,6 +136,15 @@ function overlaps(a, b) {
     return path !== '..' && !path.startsWith('..' + sep) && !isAbsolute(path)
   }
   return inside(a, b) || inside(b, a)
+}
+
+async function workspaceMemoryScope(cwd, signal) {
+  const root = workRoot(cwd)
+  if (!existsSync(join(root, '.git'))) return root
+  try {
+    const { stdout } = await executeFile('git', ['-C', root, 'rev-parse', 'HEAD'], { timeout: 1200, signal })
+    return root + '@' + stdout.trim()
+  } catch { return root }
 }
 
 export function mentionTargets(text, roles) {
@@ -165,9 +192,17 @@ function referencedConversation(state, fromId, id) {
   if (!id.startsWith('conversation:')) return null
   const thread = state.threads.find(item => item.id === id.slice('conversation:'.length) && item.id !== fromId)
   if (!thread) return null
-  const excerpt = thread.messages.filter(message => message.text && (!message.author || message.status === 'done')).slice(-4)
+  const excerpt = messageTimeline(thread.messages.filter(message => message.text && (!message.author || message.status === 'done'))).slice(-4)
     .map(message => JSON.stringify({ author: message.author?.name || '用户', text: message.text.slice(0, 700) })).join('\n')
   return { id, kind: 'conversation', name: thread.name, targetThreadId: thread.id, description: thread.description?.slice(0, 500), excerpt }
+}
+
+function memorySource(message, text = message?.text, kind) {
+  if (!message || !text?.trim()) return null
+  const speaker = message.author?.id || 'user'
+  const ref = 'message:' + message.id
+  return { id: text === message.text ? ref : ref + ':' + digest(text), ref, kind: kind || (message.author ? 'role' : 'user'),
+    speaker, body: text, at: message.at }
 }
 
 function previousMemberWork(thread, job, taskId, excludedIds) {
@@ -182,7 +217,7 @@ function latestTaskResult(thread, task, reference) {
     ? thread.messages.find(message => message.id === task.resultMessageId && message.status === 'done') : null
 }
 
-export function buildPrompt(thread, role, roles, job, { model, modelName, effort, notes, cursor, computer = false, revisions = [], references } = {}) {
+export function buildPrompt(thread, role, roles, job, { model, modelName, effort, cursor, computer = false, revisions = [], references, memory, memoryScope, memoryTools, anchorSource } = {}) {
   const others = roles.filter(item => item.id !== role.id)
   const source = thread.messages.find(message => message.id === job.sourceMessageId && !message.author)
   const reference = thread.messages.find(message => message.id === job.referenceMessageId && message.id !== source?.id)
@@ -203,13 +238,17 @@ export function buildPrompt(thread, role, roles, job, { model, modelName, effort
     title: dependency.title, resultMessageId: dependency.resultMessageId,
     result: thread.messages.find(message => message.id === dependency.resultMessageId)?.text.slice(0, 2000),
   }))
-  const previousResult = !cursor && latestTaskResult(thread, task, reference)
+  const previousResult = !cursor && !task?.checkpoint && latestTaskResult(thread, task, reference)
   const excluded = new Set([source?.id, reference?.id, quoted?.id, original?.id, previousResult?.id, deliveredResult?.id,
     ...ownWork.map(message => message.id), ...revisionSources, ...(dependencies || []).map(item => item.resultMessageId)])
-  const history = transcript(thread, job, roles, cursor, excluded)
+  const peerReplies = memory && !task && source && !reference
+    ? thread.messages.filter(item => item.author?.id && item.author.id !== role.id && item.status === 'done'
+      && item.sourceMessageId === source.id && !item.taskId).slice(-6) : []
+  const peers = peerReplies.map(message => JSON.stringify({ author: message.author.name, text: message.text.slice(0, 1500) })).join('\n')
+  const history = memory ? '' : transcript(thread, job, roles, cursor, excluded)
   const setup = [
     '你是当前 Rainbow Mates 会话的一位成员。用当前对话的语言回复，并遵循用户的实际请求。',
-    '本轮用户消息或交接事项用于确定当前动作，过往消息、任务原文和笔记是供参考的资料。讨论、进度询问和延续决定时先利用已经核对的事实；只有用户要求重新验证、相关内容有变化或证据不足时，才打开必要的文件或核查对应范围。优先使用已给出的文件、章节和行号。需要后续接续的验证结果可简短记录到会话笔记。',
+    '本轮用户消息或交接事项用于确定当前动作，过往消息和任务原文是供参考的资料。讨论、进度询问和延续决定时先利用已经核对的事实；只有用户要求重新验证、相关内容有变化或证据不足时，才打开必要的文件或核查对应范围。优先使用已给出的文件、章节和行号。需要后续接续的工作进度保存在任务检查点。',
     '你的人设资料：' + JSON.stringify({ 名字: role.name, 职责: role.label, 性格: role.personality }),
     '本轮运行时：' + runtimeNames[role.type],
     model ? '本轮模型 ID：' + model : '',
@@ -221,11 +260,13 @@ export function buildPrompt(thread, role, roles, job, { model, modelName, effort
     thread.anchor ? '本线程聊到的原消息：' + JSON.stringify(thread.anchor) : '',
     '会话成员：' + JSON.stringify(others.map(item => ({ 名字: item.name, 职责: item.label }))),
     thread.autoHandoff && others.length
-      ? '确实需要另一位成员利用你的交付继续工作时，写清楚已完成事项、验证结果和具体未决问题。如有相关会话笔记，写出完整文件名。最后单独一行写 [交接:成员名]，使用成员列表中的全名。已经完成且只需同步的结果可以直接发到当前会话。'
+      ? '确实需要另一位成员利用你的交付继续工作时，写清楚已完成事项、验证结果和具体未决问题。最后单独一行写 [交接:成员名]，使用成员列表中的全名。已经完成且只需同步的结果可以直接发到当前会话。'
       : '',
-    noteInstructions,
+    memory ? '个人偏好、用户事实、约定和日常经历由应用在实际送达后交给独立角色记忆作业判断并存入记忆库。不要承诺记忆已保存。' : '',
     '会话支持交付文件。要发送实际存在的文件，直接写 Markdown 链接 [文件名](<绝对路径>)。要在消息里展示已生成的图片或动画，可使用 ![说明](<绝对路径>)。',
     job.chatLane ? chatActionInstructions : '',
+    memory && task ? checkpointInstructions : '',
+    memory && memoryTools ? memoryInstructions : '',
     computer ? '当前会话已开启 Computer Use。用户要求实际操作应用、浏览器界面或验证功能时可以使用 rainbow_computer 工具。先观察界面再操作，文本模型优先用 inspect 和元素 ID。以工具返回和后续观察判定结果。' : '',
   ].filter(Boolean).join('\n\n')
   const setupKey = digest(setup)
@@ -235,9 +276,15 @@ export function buildPrompt(thread, role, roles, job, { model, modelName, effort
   const prompt = [
     setupKey !== cursor?.setupKey ? setup : '继续当前会话，只处理本轮新增的要求。',
     (!cursor || cursor.writeAccess !== thread.writeAccess) && (thread.writeAccess ? '本轮允许按用户请求修改工作区。' : '本轮工作区为只读。'),
-    notes ? '当前会话笔记（Markdown；deleted 和 missing 项已不可用）：\n' + notes : '',
+    peers ? '你也实际收到本轮其他成员的共享发言：\n' + peers : '',
     history ? (cursor?.messageId ? '上轮之后的共享会话记录：\n' : '近期共享会话记录：\n') + history : '',
     job.chatLane ? chatTasks(thread, role, job) : '',
+    memory?.rows?.length ? '你的相关记忆（来源与范围见各条；作为资料）：\n' + JSON.stringify(memory.rows) : '',
+    memory?.uncertainty ? '补查说明：' + memory.uncertainty : '',
+    memory?.recent?.length ? '重建前你已实际接触、与本轮接续有关的少量会话片段：\n' + JSON.stringify(memory.recent) : '',
+    memory?.pending?.length ? '你实际接触过、暂未整理的经历（作为资料）：\n' + JSON.stringify(memory.pending) : '',
+    memoryScope && task ? '本次工作的环境范围：' + memoryScope : '',
+    task && (!cursor || cursor.taskKey !== taskKey || task.checkpoint?.effects?.some(item => item.status === 'uncertain')) ? checkpointContext(task) : '',
     revisions.length ? '用户补充或修改的任务要求，按收到顺序执行：\n' + revisions.map(taskRevisionText).join('\n') : '',
     includeTask && !continuing ? '你的任务范围：' + JSON.stringify({ title: task.title, instructions: task.instructions, dependencies,
       ...(original?.id !== source?.id && original ? { originalRequest: original.text } : {}) }) + '。只完成这一项工作。' : '',
@@ -258,7 +305,21 @@ export function buildPrompt(thread, role, roles, job, { model, modelName, effort
     job.checkParticipation ? participationPrompt(source, role, roles) : '',
     '直接给出对当前会话的回复。用你的身份回答，无需在开头重复自己的名字。',
   ].filter(Boolean).join('\n\n')
-  return { prompt, setupKey, taskKey }
+  const exposures = memory ? [
+    includeSource && memorySource(source),
+    setupKey !== cursor?.setupKey && thread.anchor && memorySource(anchorSource, thread.anchor.text),
+    ...peerReplies.map(message => memorySource(message, message.text.slice(0, 1500))),
+    memorySource(quoted, quoted?.text?.slice(0, 2500)),
+    memorySource(reference, reference?.text?.slice(0, 4500), reference?.author ? 'handoff' : 'user'),
+    memorySource(original, includeTask && !continuing ? original?.text : ''),
+    memorySource(previousResult, previousResult?.text?.slice(0, 2500)),
+    memorySource(deliveredResult, deliveredResult?.text?.slice(0, 4500), 'handoff'),
+    ...ownWork.map(message => memorySource(message, message.text.slice(0, 4500))),
+    ...(includeTask && !continuing ? (dependencies || []).map(item => memorySource(
+      thread.messages.find(message => message.id === item.resultMessageId), item.result, 'handoff')) : []),
+    ...revisions.map(revision => memorySource(thread.messages.find(message => message.id === revision.sourceMessageId), revision.sourceText)),
+  ].filter(Boolean) : []
+  return { prompt, setupKey, taskKey, exposures }
 }
 
 function participationPrompt(source, role, roles) {
@@ -287,13 +348,62 @@ const taskRevisionText = revision => '任务更新（来自用户）：' + JSON.
 })
 
 export class Conversations {
-  constructor({ store, defaultDirectory, publish, draft, activity, computer, references, run = runRuntime, locate = findRuntime, readCatalog = readRuntimeCatalog }) {
-    Object.assign(this, { store, defaultDirectory, publish, draft, activity, computer, references, run, locate, readCatalog })
-    this.notes = new Notes(join(dirname(store.filename), 'notes'))
+  constructor({ store, defaultDirectory, publish, draft, activity, computer, references, memory, memoryStartupError, run = runRuntime, locate = findRuntime, readCatalog = readRuntimeCatalog }) {
+    Object.assign(this, { store, defaultDirectory, publish, draft, activity, computer, references, memory, memoryStartupError, run, locate, readCatalog })
     this.groups = new Map()
     this.activeRoles = new Map()
     this.liveActivity = new Map()
     this.catalogs = new Map()
+    this.jobOrder = 0
+    memory?.configure({
+      actors: () => this.store.value.roles.map(role => this.memoryOwner(role.id)),
+      resolveRole: owner => this.memoryRuntime(owner),
+      beforeTick: () => this.flushMemoryOutbox(),
+      onStatus: () => this.publish?.(this.snapshot()),
+    })
+  }
+
+  memoryOwner(roleId) {
+    return this.memory?.owner(roleId, this.store.value.localProfileId)
+  }
+
+  flushMemoryOutbox() {
+    if (!this.memory || this.memory.closed) return
+    const done = new Set()
+    for (const item of this.store.value.memoryOutbox || []) {
+      if (!this.memory.capture(item.owner, item.eventId, item.sources)) continue
+      try {
+        this.memory.database.use(item.owner, item.eventId, 'message:' + item.eventId, item.uses, new Map(item.sent), item.at)
+        done.add(item.eventId)
+      } catch (error) { this.memory.issue('receipt', error) }
+    }
+    if (done.size) {
+      try {
+        this.store.mutate(state => {
+          state.memoryOutbox = state.memoryOutbox.filter(item => !done.has(item.eventId))
+          if (!state.memoryOutbox.length) delete state.memoryOutbox
+        })
+        this.memory.recover('receipt')
+      } catch (error) { this.memory.issue('receipt', error) }
+    }
+  }
+
+  async memoryRuntime(owner) {
+    const { roles, settings } = this.store.value
+    const role = roles.find(item => this.memoryOwner(item.id) === owner)
+    if (!role?.model) return null
+    const binary = this.locate(role.type, role.type === 'codex' ? settings.codexPath : settings.deepseekPath)
+    if (!binary) return null
+    const catalog = await this.runtimeCatalog(role.type, binary)
+    const model = catalog?.models.find(item => item.id === role.model)
+    if (this.readCatalog && (!model || effortError(model, role.effort))) return null
+    return {
+      role,
+      run: options => this.run({
+        ...options, type: role.type, binary, cwd: this.defaultDirectory, model: role.model, effort: role.effort,
+        provider: catalog?.provider, writeAccess: false, ephemeral: true,
+      }),
+    }
   }
 
   change(operation) {
@@ -323,11 +433,12 @@ export class Conversations {
     })
     return { roles: roleDetails, settings, activeThreadId, threadGroups, runtimes, defaultDirectory: this.defaultDirectory,
       computerAvailable: Boolean(this.computer?.available),
+      memory: this.memory?.status() || (this.memoryStartupError ? { error: this.memoryStartupError, pending: 0 } : undefined),
       threads: threads.map(({ sessions, ...thread }) => ({ ...thread,
         computerUse: thread.computerUse === true,
-        messages: thread.messages.filter(visibleMessage).map(publicMessage),
+        messages: messageTimeline(thread.messages.filter(visibleMessage)).map(publicMessage),
         busy: this.groups.has(thread.id),
-        tasks: (thread.tasks || []).map(({ sessions, ...task }) => task), noteFiles: this.notes.list(thread.id) })) }
+        tasks: (thread.tasks || []).map(({ sessions, ...task }) => task) })) }
   }
 
   runtimeCatalog(type, path) {
@@ -418,14 +529,6 @@ export class Conversations {
       case 'reply': return this.openReply(input)
       case 'threadSettings': return this.saveThread(input)
       case 'threadRoles': return this.saveThreadRoles(input)
-      case 'readNote':
-        getThread(this.store.value, threadId)
-        return this.notes.read(threadId, input.file)
-      case 'deleteNote':
-        getThread(this.store.value, threadId)
-        this.notes.delete(threadId, input.file)
-        this.publish?.(this.snapshot())
-        return
       case 'role': return this.saveRole(input)
       case 'appearanceSettings': {
         if (input.theme !== 'light' && input.theme !== 'dark') throw new Error('请选择浅色或深色主题。')
@@ -488,7 +591,6 @@ export class Conversations {
       }
       return removed
     })
-    for (const id of deleted) this.notes.deleteThread(id)
   }
 
   exportThread(threadId) {
@@ -504,10 +606,9 @@ export class Conversations {
         id: thread.id, parentId: thread.parentId, name: thread.name, description: thread.description, kind: thread.kind,
         anchorMessageId: thread.anchorMessageId, anchor: thread.anchor, activityAt: thread.activityAt,
         members: thread.roleIds.map(id => roleView(getRole(state, id))),
-        messages: thread.messages.filter(message => visibleMessage(message) && !['queued', 'running'].includes(message.status))
+        messages: messageTimeline(thread.messages.filter(message => visibleMessage(message) && !inFlight(message)))
           .map(({ background, ...message }) => publicMessage(message)),
         tasks: (thread.tasks || []).map(({ sessions, ...task }) => task),
-        notes: this.notes.list(thread.id).map(file => ({ file, markdown: this.notes.read(thread.id, file) })),
       })),
     }
   }
@@ -697,7 +798,7 @@ export class Conversations {
     const messageId = randomUUID()
     thread.messages.push({ id: messageId, at: Date.now(), text: '', status: 'queued', author: roleView(role), handoffFrom: from,
       sourceMessageId, referenceMessageId, taskId, background: background || undefined })
-    return { role, messageId, origin, sourceMessageId, referenceMessageId, taskId, handoffTaskId, chatTaskId, checkParticipation, passive, chatLane: !taskId }
+    return { order: ++this.jobOrder, role, messageId, origin, sourceMessageId, referenceMessageId, taskId, handoffTaskId, chatTaskId, checkParticipation, passive, chatLane: !taskId }
   }
 
   receiveTaskAction(state, thread, job, group, action) {
@@ -743,6 +844,9 @@ export class Conversations {
         const source = thread.messages.find(message => message.id === revision.sourceMessageId)
         const refs = runtimeReferences(source?.references || [], job.role.type)
         if (!await steer([taskRevisionText(revision), referenceContext(refs)].filter(Boolean).join('\n\n'), revision.id, refs)) return
+        const owner = this.memoryOwner(job.role.id)
+        const experience = memorySource(source, revision.sourceText)
+        if (experience) this.memory?.capture(owner, job.messageId, [experience])
         entry.observedRevisions++
       }
       deliveredAll = true
@@ -754,6 +858,14 @@ export class Conversations {
 
   pump() {
     let started = false
+    const oldest = new Map()
+    for (const groups of this.groups.values()) for (const group of groups) {
+      if (group.stopped) continue
+      for (const job of group.jobs) {
+        if (!job.chatLane) continue
+        oldest.set(job.role.id, Math.min(oldest.get(job.role.id) ?? Infinity, job.order))
+      }
+    }
     for (const [threadId, groups] of this.groups) {
       for (const group of groups) {
         if (!group.stopped && !this.stoppingAll) {
@@ -772,6 +884,7 @@ export class Conversations {
               })
               continue
             }
+            if (job.chatLane && oldest.get(job.role.id) !== job.order) continue
             const running = [...this.activeRoles.values()]
             const key = activeKey(job)
             if (unfinished.length || (group.serial && group.running.size) || this.activeRoles.has(key)
@@ -810,7 +923,9 @@ export class Conversations {
     const roles = thread.roleIds.map(id => getRole(state, id))
     const settings = state.settings
     const task = taskById(thread, job.taskId)
-    const session = (task?.sessions || thread.sessions)[role.id]
+    const owner = this.memoryOwner(role.id)
+    const globalChat = Boolean(this.memory && !task)
+    const session = (globalChat ? state.chatSessions : task?.sessions || thread.sessions)?.[role.id]
     const path = this.locate(role.type, role.type === 'codex' ? settings.codexPath : settings.deepseekPath)
     const cwd = thread.cwd || this.defaultDirectory
     const model = role.model || ''
@@ -822,9 +937,10 @@ export class Conversations {
     const modelName = selected?.label || ''
     const sessionKeyFor = permission => JSON.stringify([role.type, path, cwd, permission, model, role.name, role.label, role.personality,
       ...(effort ? [effort] : [])])
-    const sessionKey = sessionKeyFor(thread.writeAccess)
+    const sessionKey = sessionKeyFor(this.memory ? writeAccess : thread.writeAccess)
     const compatibleKey = session?.key === sessionKey || thread.writeAccess && session?.key === sessionKeyFor(false)
-    const canResume = compatibleKey && (!session.model || session.model === model)
+    const withinIdleWindow = !globalChat || Boolean(session?.lastChatAt && Date.now() - session.lastChatAt < CHAT_IDLE_MS)
+    let canResume = compatibleKey && withinIdleWindow && (!session.model || session.model === model)
       && (!session.effort || session.effort === effort)
     this.change(current => {
       const updated = getThread(current, threadId)
@@ -833,13 +949,19 @@ export class Conversations {
       if (task) message.startedAt = Date.now()
       message.author = roleView(role)
       const currentTask = taskById(updated, job.taskId)
-      if (currentTask) Object.assign(currentTask, { status: 'running', roleId: role.id })
+      if (currentTask) {
+        Object.assign(currentTask, { status: 'running', roleId: role.id })
+        if (this.memory) currentTask.checkpoint = taskCheckpoint(currentTask, message, {
+          now: Date.now(), revisions: currentTask.revisions?.length || 0, outcome: 'running',
+        })
+      }
       if (model) message.model = model
       if (modelName && modelName !== model) message.modelName = modelName
       if (effort) message.effort = effort
     })
-    const anchorRole = state.threads.find(item => item.id === thread.parentId)?.messages
-      .find(message => message.id === thread.anchorMessageId)?.author?.id
+    const anchorSource = state.threads.find(item => item.id === thread.parentId)?.messages
+      .find(message => message.id === thread.anchorMessageId)
+    const anchorRole = anchorSource?.author?.id
     const name = state.roles.find(item => item.id === anchorRole)?.name
     const latest = getThread(this.store.value, threadId)
     const promptThread = { ...latest, writeAccess, ...(name && latest.anchor ? { anchor: { ...latest.anchor, name } } : {}) }
@@ -849,10 +971,20 @@ export class Conversations {
     entry.observedRevisions = revisions.length
     let result
     let failure
-    let noteVersions
     let context
     let grant
     const events = new Map()
+    const sent = new Map()
+    const learnedTools = new Set()
+    let nativeThreadId
+    let memoryGrant
+    let memoryContext
+    let memoryReply
+    const finishMemory = this.memory?.begin(owner)
+    const trackContext = () => {
+      try { this.memory?.database.acceptContext(owner, nativeThreadId, sent) }
+      catch (error) { this.memory?.issue('context', error) }
+    }
     this.liveActivity.set(job.messageId, events)
     try {
       if (!model) throw new Error('请先在角色设置中为「' + role.name + '」选择模型。')
@@ -862,37 +994,92 @@ export class Conversations {
       }
       const invalidEffort = selected && effortError(selected, effort)
       if (invalidEffort) throw new Error('请为「' + role.name + '」选择该模型支持的推理强度。')
+      const scope = this.memory ? await workspaceMemoryScope(cwd, controller.signal) : cwd
+      if (this.memory) {
+        this.flushMemoryOutbox()
+        try { await this.memory.ready(owner, controller.signal) }
+        catch (error) { this.memory.issue('queue', error) }
+        controller.signal.throwIfAborted()
+        const query = [latest.messages.find(message => message.id === job.sourceMessageId)?.text,
+          latest.messages.find(message => message.id === job.referenceMessageId)?.text, task?.revisions?.at(-1)?.instructions || task?.instructions]
+          .filter(Boolean).join('\n').slice(0, 4000)
+        try {
+          const { results: rows, uncertainty } = query
+            ? await this.memory.searchForTurn(owner, query, { scope, signal: controller.signal, refine: !passive })
+            : { results: [] }
+          for (const row of rows) sent.set(row.id, row.version)
+          memoryContext = { rows, uncertainty, pending: this.memory.pendingContext(owner) }
+          this.memory.recover('retrieval')
+        } catch (error) {
+          if (controller.signal.aborted) throw error
+          this.memory.issue('retrieval', error)
+          memoryContext = { pending: this.memory.pendingContext(owner) }
+        }
+        try {
+          memoryGrant = await this.memory.toolFor(owner, { signal: controller.signal, scope, sent,
+            refine: !passive, remember: trackContext })
+        } catch (error) { this.memory.issue('mcp', error) }
+      }
       if (task && thread.computerUse && this.computer?.available) {
         grant = await this.computer.grant(controller.signal)
       }
       const reference = latest.messages.find(message => message.id === job.referenceMessageId)
       const source = thread.messages.find(message => message.id === job.sourceMessageId)
-      const named = this.notes.list(threadId).filter(file => reference?.text.includes(file) || source?.text.includes(file))
       const continuation = task && reference?.status === 'done' && reference.taskId === task.id
-      const deliveredResult = latestTaskResult(latest, taskById(latest, job.handoffTaskId), reference)
-      const ownWork = job.handoffTaskId || continuation
-        ? previousMemberWork(latest, job, job.handoffTaskId || task.id, [reference?.id, deliveredResult?.id]) : []
-      const handoffNotes = [reference, deliveredResult, ...ownWork].flatMap(message => message?.noteRefs || [])
-      const preferred = [...new Set([...handoffNotes, ...named])].slice(0, 8)
-      const execute = cursor => {
-        const notes = this.notes.context(threadId, { seen: cursor?.noteVersions,
-          preferred: cursor ? preferred : [...new Set([...(task?.noteRefs || []), ...preferred])].slice(0, 8) })
-        noteVersions = notes.versions
+      const stale = session?.id && this.memory?.staleContext(owner, session.id)
+      if (stale) canResume = false
+      const execute = resume => {
+        const cursor = !globalChat || resume?.threadId === threadId ? resume : undefined
         const quoted = latest.messages.find(message => message.id === source?.replyToId)
         const original = !cursor && latest.messages.find(message => message.id === task?.sourceMessageId)
         const pendingRevisions = revisions.slice(cursor || continuation ? task?.appliedRevisions || 0 : 0)
         const revisedMessages = pendingRevisions.map(revision => latest.messages.find(message => message.id === revision.sourceMessageId))
         const items = [source, quoted, original, ...revisedMessages].filter(Boolean).flatMap(message => message.references || [])
         const refs = passive ? [] : runtimeReferences([...new Map(items.map(item => [item.id, item])).values()], role.type)
-        context = buildPrompt(promptThread, role, roles, job, { model, modelName, effort, notes: notes.context, cursor, computer: Boolean(grant),
-          revisions: pendingRevisions, references: referenceContext(refs) })
+        const reconnecting = this.memory && !task && !resume && !stale
+          && (session?.threadId === threadId || /继续|接着|上次|刚才|continue|follow.up/i.test(source?.text || ''))
+        const recent = reconnecting ? messageTimeline(latest.messages).slice(-16)
+          .filter(item => item?.text && item.id !== source?.id && item.id !== reference?.id && (!item.author || item.status === 'done')
+            && (!source?.seq || (item.seq || 0) < source.seq) && this.memory.seenMessage(owner, item.id))
+          .slice(-3).map(item => ({ author: item.author?.name || '用户', text: item.text.slice(0, 1200) })) : []
+        context = buildPrompt(promptThread, role, roles, job, { model, modelName, effort, cursor, computer: Boolean(grant),
+          revisions: pendingRevisions, references: referenceContext(refs), memory: this.memory ? { ...memoryContext, recent } : null,
+          memoryScope: this.memory ? scope : '', memoryTools: Boolean(memoryGrant), anchorSource })
+        const exposures = [...context.exposures]
+        if (this.memory) {
+          for (const item of refs.filter(item => typeof item.excerpt === 'string' && item.excerpt.trim())) {
+            const ref = 'reference:' + (item.targetThreadId || item.path || item.id)
+            const id = ref + ':' + digest(item.excerpt)
+            exposures.push({ id, ref, kind: item.kind === 'conversation' ? 'handoff' : 'reference',
+              speaker: 'reference', body: item.excerpt, scope: item.kind === 'conversation' ? undefined : scope })
+          }
+        }
+        let delivered = false
+        const onDelivered = threadId => {
+          if (delivered) return
+          delivered = true
+          nativeThreadId = threadId
+          if (this.stoppingAll) return
+          if (this.memory) {
+            this.memory.capture(owner, job.messageId, exposures)
+            trackContext()
+          }
+        }
         return this.run({
-          type: role.type, binary: path, cwd, sessionId: cursor?.id,
+          type: role.type, binary: path, cwd, sessionId: resume?.id,
           writeAccess, model, effort, provider: catalog?.provider, computerUrl: grant?.url,
-          prompt: context.prompt, references: refs,
+          prompt: context.prompt, references: refs, memoryUrl: memoryGrant?.url,
+          ...(this.memory && { onDelivered, onToolResult: (id, item) => {
+            if (!delivered || this.stoppingAll || !id || learnedTools.has(id) || learnedTools.size >= 48) return
+            learnedTools.add(id)
+            const ref = 'tool:' + job.messageId + ':' + id
+            this.memory.capture(owner, job.messageId, [{
+              id: ref, ref, kind: 'tool', speaker: role.id, body: JSON.stringify(item).slice(0, 8000), scope,
+            }])
+          } }),
           signal: controller.signal,
           onDraft: text => {
-            if (!passive) this.draft?.({ threadId, messageId: job.messageId, text: visibleChatDraft(visibleDraft(text)).slice(0, MESSAGE_LIMIT) })
+            if (!passive) this.draft?.({ threadId, messageId: job.messageId, text: visibleChatDraft(stripLegacyNotes(this.memory ? hideMemoryDraft(text) : text)).slice(0, MESSAGE_LIMIT) })
           },
           onActivity: event => {
             const previous = events.get(event.id)
@@ -901,117 +1088,145 @@ export class Conversations {
             const item = { at: Date.now(), ...previous,
               ...Object.fromEntries(Object.entries(event).filter(([, value]) => value !== '' && value !== undefined)) }
             events.set(item.id, item)
+            if (task && this.memory && ['command', 'tool', 'changes'].includes(item.kind)
+              && (!previous || previous.status !== item.status)) {
+              this.change(current => {
+                const activeTask = taskById(getThread(current, threadId), job.taskId)
+                activeTask.checkpoint = taskCheckpoint(activeTask, { id: job.messageId, activity: [...events.values()] }, {
+                  now: Date.now(), revisions: entry.observedRevisions, outcome: 'running',
+                })
+              })
+            }
             this.activity?.({ threadId, messageId: job.messageId, item })
           },
           ...(task ? { onSteer: callback => { entry.steer = callback; this.deliverTaskRevisions(entry) } } : {}),
-        })
+        }).then(result => { onDelivered(result.sessionId); return result })
       }
       try {
         result = await execute(canResume ? session : undefined)
       } catch (error) {
-        const canRebuild = error.code === 'RDS_SESSION_MISSING' || error.code === 'RDS_SESSION_BUSY'
-        if (!canResume || !canRebuild || controller.signal.aborted) throw error
+        const canRebuild = ['RDS_SESSION_MISSING', 'RDS_SESSION_BUSY', 'RDS_CONTEXT_LIMIT'].includes(error.code)
+        if (!canResume || !canRebuild || controller.signal.aborted
+          || task && error.code === 'RDS_CONTEXT_LIMIT' && events.size) throw error
         result = await execute()
       }
-    } catch (error) { failure = error } finally { grant?.close(); this.liveActivity.delete(job.messageId) }
+    } catch (error) { failure = error } finally {
+      memoryGrant?.close()
+      grant?.close()
+      this.liveActivity.delete(job.messageId)
+    }
+    if (result && this.memory) {
+      memoryReply = parseMemoryReply(result.text)
+      result.text = memoryReply.text
+      if (result.sessionId) nativeThreadId = result.sessionId
+      trackContext()
+    }
     entry.steer = null
     await entry.delivery
     let changedTask
-    this.change(current => {
-      const updated = getThread(current, threadId)
-      const message = updated.messages.find(item => item.id === job.messageId)
-      const currentTask = taskById(updated, job.taskId)
-      if (currentTask) message.finishedAt = Date.now()
-      if (events.size) message.activity = [...events.values()]
-      if (group.stopped || failure) {
-        if (!group.stopped && job.checkParticipation && (passive || message.background && (!path || !model))) {
+    let publishedMessage
+    try {
+      this.change(current => {
+        const updated = getThread(current, threadId)
+        const message = updated.messages.find(item => item.id === job.messageId)
+        const currentTask = taskById(updated, job.taskId)
+        if (currentTask) message.finishedAt = Date.now()
+        if (events.size) message.activity = [...events.values()]
+        const saveCheckpoint = outcome => {
+          if (!currentTask || !this.memory) return
+          currentTask.checkpoint = taskCheckpoint(currentTask, message, { now: Date.now(),
+            revisions: entry.observedRevisions, outcome, proposed: memoryReply?.checkpoint })
+        }
+        if (group.stopped || failure) {
+          if (!group.stopped && job.checkParticipation && (passive || message.background && (!path || !model))) {
+            updated.messages = updated.messages.filter(item => item.id !== job.messageId)
+            return
+          }
+          message.status = group.stopped ? 'stopped' : 'error'
+          message.at = message.finishedAt ?? Date.now()
+          message.error = group.stopped ? '本轮已停止。' : failure.message
+          if (currentTask && !group.stopped && (currentTask.revisions?.length || 0) > entry.observedRevisions) {
+            currentTask.status = 'queued'
+            group.jobs.push(this.queue(current, updated, role.id, '继续处理最新任务要求', { taskId: currentTask.id, sourceMessageId: job.sourceMessageId }))
+          } else if (currentTask) currentTask.status = message.status
+          saveCheckpoint(message.status)
+          return
+        }
+        const sessions = globalChat ? (current.chatSessions ||= {}) : currentTask?.sessions || updated.sessions
+        if (result.sessionId) sessions[role.id] = { id: result.sessionId, key: sessionKey, model, effort, messageId: job.messageId, seenSeq,
+          ...(globalChat && { threadId, lastChatAt: Date.now() }),
+          setupKey: context.setupKey, taskKey: context.taskKey, writeAccess }
+        if (passive || (job.checkParticipation || job.handoffTaskId) && result.text.trim() === '[略过]') {
           updated.messages = updated.messages.filter(item => item.id !== job.messageId)
           return
         }
-        message.status = group.stopped ? 'stopped' : 'error'
-        message.error = group.stopped ? '本轮已停止。' : failure.message
-        if (currentTask && !group.stopped && (currentTask.revisions?.length || 0) > entry.observedRevisions) {
-          currentTask.status = 'queued'
-          group.jobs.push(this.queue(current, updated, role.id, '继续处理最新任务要求', { taskId: currentTask.id, sourceMessageId: job.sourceMessageId }))
-        } else if (currentTask) currentTask.status = message.status
-        return
-      }
-      const sessions = currentTask?.sessions || updated.sessions
-      if (result.sessionId) sessions[role.id] = { id: result.sessionId, key: sessionKey, model, effort, messageId: job.messageId, seenSeq,
-        noteVersions, setupKey: context.setupKey, taskKey: context.taskKey, writeAccess }
-      if (passive || (job.checkParticipation || job.handoffTaskId) && result.text.trim() === '[略过]') {
-        updated.messages = updated.messages.filter(item => item.id !== job.messageId)
-        return
-      }
-      const chatReply = job.chatLane ? parseChatAction(result.text) : { text: result.text }
-      const noteReply = parseNoteReply(chatReply.text)
-      if (currentTask) {
-        currentTask.appliedRevisions = entry.observedRevisions
-        if ((currentTask.revisions || []).length > entry.observedRevisions) {
-          message.status = 'held'
-          message.heldText = readHandoff(noteReply.text, roles, role.id).text.slice(0, MESSAGE_LIMIT)
-          Object.assign(currentTask, { status: 'queued', heldMessageId: message.id })
-          group.jobs.push(this.queue(current, updated, role.id, '继续处理最新任务要求', { taskId: currentTask.id, sourceMessageId: job.sourceMessageId }))
-          return
-        }
-      }
-      const work = chatReply.action && this.receiveTaskAction(current, updated, job, group, chatReply.action)
-      if (work?.revision) changedTask = work.task.id
-      if (work?.task) message.taskThreadId = work.task.id
-      if (chatReply.error || work?.error) message.taskError = chatReply.error || work.error
-      let noteError = noteReply.error
-      let updatedNotes = false
-      const written = []
-      for (const operation of noteReply.operations) {
-        try {
-          if (operation.op === 'write') {
-            this.notes.write(threadId, operation.file, operation.markdown)
-            written.push(operation.file)
+        const chatReply = job.chatLane ? parseChatAction(result.text) : { text: result.text }
+        const replyText = stripLegacyNotes(chatReply.text)
+        if (currentTask) {
+          currentTask.appliedRevisions = entry.observedRevisions
+          if ((currentTask.revisions || []).length > entry.observedRevisions) {
+            message.status = 'held'
+            message.heldText = readHandoff(replyText, roles, role.id).text.slice(0, MESSAGE_LIMIT)
+            Object.assign(currentTask, { status: 'queued', heldMessageId: message.id })
+            saveCheckpoint('held')
+            group.jobs.push(this.queue(current, updated, role.id, '继续处理最新任务要求', { taskId: currentTask.id, sourceMessageId: job.sourceMessageId }))
+            return
           }
-          else this.notes.delete(threadId, operation.file)
-          updatedNotes = true
-        } catch {
-          noteError = '无法更新部分会话笔记。'
+        }
+        const work = chatReply.action && this.receiveTaskAction(current, updated, job, group, chatReply.action)
+        if (work?.revision) changedTask = work.task.id
+        if (work?.task) message.taskThreadId = work.task.id
+        if (chatReply.error || work?.error) message.taskError = chatReply.error || work.error
+        const text = replyText || (work?.task ? work.revision ? '我会按最新要求更新任务。' : '我开始处理这项任务。' : '')
+        const reply = updated.autoHandoff ? readHandoff(text, roles, role.id) : { text }
+        message.status = 'done'
+        message.at = Date.now()
+        message.text = reply.text.slice(0, MESSAGE_LIMIT)
+        stamp(current, updated, message)
+        publishedMessage = message
+        saveCheckpoint('done')
+        if (currentTask) {
+          delete currentTask.heldMessageId
+          Object.assign(currentTask, { status: 'done', resultMessageId: message.id })
+        }
+        const handoffTaskId = job.taskId || job.handoffTaskId
+        const pending = group.jobs.find(item => item.role.id === reply.to && !item.taskId && !item.referenceMessageId
+          && item.sourceMessageId === job.sourceMessageId)
+        if (reply.to && group.handoffs < AUTO_HANDOFF_LIMIT && !group.transferred.has(visitKey(reply.to, handoffTaskId))
+            && updated.roleIds.includes(reply.to)) {
+          message.handoffTo = reply.to
+          group.handoffs++
+          group.transferred.add(visitKey(role.id, handoffTaskId))
+          group.transferred.add(visitKey(reply.to, handoffTaskId))
+          const origin = role.name + ' 交接'
+          if (pending) {
+            const queued = updated.messages.find(item => item.id === pending.messageId)
+            Object.assign(queued, { handoffFrom: role.name, referenceMessageId: message.id, background: undefined })
+            Object.assign(pending, { origin, referenceMessageId: message.id, handoffTaskId, checkParticipation: false, passive: false })
+          } else {
+            group.jobs.push(this.queue(current, updated, reply.to, origin, {
+              from: role.name, sourceMessageId: job.sourceMessageId, referenceMessageId: message.id, handoffTaskId,
+            }))
+          }
+        }
+        if (this.memory) {
+          const experience = memorySource(message)
+          const sources = [experience].filter(Boolean)
+          if (currentTask?.checkpoint) sources.push({ id: 'checkpoint:' + job.messageId, ref: 'task:' + job.taskId,
+            kind: 'role', speaker: role.id, body: JSON.stringify(currentTask.checkpoint) })
+          const uses = (memoryReply?.used || []).filter(item => sent.get(item.id) === item.version)
+          const outbox = current.memoryOutbox ||= []
+          outbox.push({ owner, eventId: job.messageId, at: message.at,
+            sources, uses, sent: uses.map(({ id, version }) => [id, version]) })
+        }
+      })
+      if (publishedMessage && this.memory) {
+        this.flushMemoryOutbox()
+        if (session?.id && result?.sessionId && session.id !== result.sessionId) {
+          try { this.memory.database.discardContext(owner, session.id) } catch (error) { this.memory.issue('context', error) }
         }
       }
-      const noteSummary = updatedNotes ? '已更新会话笔记。' : '会话笔记更新失败。'
-      const body = noteReply.text || (work?.task ? work.revision ? '我会按最新要求更新任务。' : '我开始处理这项任务。' : '')
-      const text = (updatedNotes || noteError) && /^(?:\[交接[：:][^\]\n]+\])?$/.test(noteReply.text)
-        ? [noteSummary, body].filter(Boolean).join('\n') : body
-      const reply = updated.autoHandoff ? readHandoff(text, roles, role.id) : { text }
-      if (noteError) message.noteError = noteError
-      message.status = 'done'
-      message.at = Date.now()
-      message.text = reply.text.slice(0, MESSAGE_LIMIT)
-      stamp(current, updated, message)
-      const noteRefs = this.notes.list(threadId).filter(file => written.includes(file) || message.text.includes(file)).slice(0, 8)
-      if (noteRefs.length) message.noteRefs = noteRefs
-      if (currentTask) {
-        delete currentTask.heldMessageId
-        Object.assign(currentTask, { status: 'done', resultMessageId: message.id,
-          noteRefs: [...new Set([...noteRefs, ...(currentTask.noteRefs || [])])].slice(0, 8) })
-      }
-      const handoffTaskId = job.taskId || job.handoffTaskId
-      const pending = group.jobs.find(item => item.role.id === reply.to && !item.taskId && !item.referenceMessageId
-        && item.sourceMessageId === job.sourceMessageId)
-      if (reply.to && group.handoffs < AUTO_HANDOFF_LIMIT && !group.transferred.has(visitKey(reply.to, handoffTaskId))
-          && updated.roleIds.includes(reply.to)) {
-        message.handoffTo = reply.to
-        group.handoffs++
-        group.transferred.add(visitKey(role.id, handoffTaskId))
-        group.transferred.add(visitKey(reply.to, handoffTaskId))
-        const origin = role.name + ' 交接'
-        if (pending) {
-          const queued = updated.messages.find(item => item.id === pending.messageId)
-          Object.assign(queued, { handoffFrom: role.name, referenceMessageId: message.id, background: undefined })
-          Object.assign(pending, { origin, referenceMessageId: message.id, handoffTaskId, checkParticipation: false, passive: false })
-        } else {
-          group.jobs.push(this.queue(current, updated, reply.to, origin, {
-            from: role.name, sourceMessageId: job.sourceMessageId, referenceMessageId: message.id, handoffTaskId,
-          }))
-        }
-      }
-    })
+    } finally { finishMemory?.() }
     if (changedTask) {
       const taskEntry = [...this.activeRoles.values()].find(item => item.threadId === threadId && item.job.taskId === changedTask)
       if (taskEntry) this.deliverTaskRevisions(taskEntry)
@@ -1027,9 +1242,11 @@ export class Conversations {
     }
     this.change(state => {
       const thread = getThread(state, threadId)
+      const at = Date.now()
       for (const message of thread.messages) {
         if (message.status !== 'queued') continue
         message.status = 'stopped'
+        message.at = at
         message.error = '本轮已停止。'
       }
       for (const task of thread.tasks || []) {

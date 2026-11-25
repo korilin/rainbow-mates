@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -109,6 +109,29 @@ test('shared history advances in order and runtime sessions belong to thread and
   assert.equal(reopened.value.activeThreadId, branch)
   assert.equal(reopened.value.threads[0].messages.length, 5)
   assert.equal(reopened.value.threads.at(-1).messages.length, 4)
+})
+
+test('a delayed reply appears after messages sent while it was running', async t => {
+  let finishDeepSeek
+  const { app, file } = workspace(t, async call => {
+    if (call.type === 'codex') return { text: 'B' }
+    return new Promise(resolve => { finishDeepSeek = resolve })
+  })
+  const threadId = 'clubroom'
+  const messages = () => app.snapshot().threads[0].messages
+  app.dispatch('send', { threadId, text: 'A', targetIds: ['codex', 'deepseek'] })
+  await until(() => finishDeepSeek && messages().some(message => message.text === 'B'))
+  app.dispatch('send', { threadId, text: 'A1', targetIds: [] })
+  assert.deepEqual(messages().map(message => message.text), ['A', 'B', 'A1', ''])
+  assert.equal(messages().at(-1).status, 'running')
+  assert.deepEqual(app.exportThread(threadId).conversations[0].messages.map(message => message.text), ['A', 'B', 'A1'])
+  finishDeepSeek({ text: 'C' })
+  await settled(app)
+  const expected = ['A', 'B', 'A1', 'C']
+  assert.deepEqual(messages().map(message => message.text), expected)
+  assert.deepEqual(app.exportThread(threadId).conversations[0].messages.map(message => message.text), expected)
+  const reopened = new Conversations({ store: new Store(file), locate: () => null })
+  assert.deepEqual(reopened.snapshot().threads[0].messages.map(message => message.text), expected)
 })
 
 test('auto handoff carries context and cannot ping-pong', async t => {
@@ -384,7 +407,7 @@ test('legacy conversations move into the default group and activity follows the 
   assert.equal(thread(branch).messages.length, 2)
 })
 
-test('conversation export retains IDs, quoted replies, notes and tasks without runtime session mappings', async t => {
+test('conversation export retains IDs, quoted replies and tasks without runtime session mappings', async t => {
   const { app, store } = workspace(t, async call => ({
     text: call.onSteer ? '已验收' : start('验证导出'), sessionId: 'private-runtime-session',
   }))
@@ -395,60 +418,20 @@ test('conversation export retains IDs, quoted replies, notes and tasks without r
   const branch = app.dispatch('reply', { threadId, messageId: anchor.id })
   app.dispatch('send', { threadId: branch, text: '保留引用', targetIds: [] })
   app.dispatch('send', { threadId, text: '引用补充', replyToId: anchor.id, targetIds: [] })
-  app.notes.write(threadId, '验收.md', '# 已完成')
-  app.notes.write(branch, '记录.md', '回复线程笔记')
   const exported = app.exportThread(threadId)
   assert.equal(app.dispatch('threadId', { threadId }), threadId)
   assert.equal(exported.threadId, threadId)
   const [root, reply] = exported.conversations
   assert.equal(root.messages.find(item => item.text === '引用补充').replyToId, anchor.id)
   assert.equal(root.tasks[0].status, 'done')
-  assert.equal(root.notes[0].markdown, '# 已完成\n')
   assert.equal(reply.parentId, threadId)
-  assert.equal(reply.notes[0].markdown, '回复线程笔记\n')
   assert.equal(reply.anchorMessageId, anchor.id)
   assert.deepEqual(app.exportThread(branch).conversations.map(item => item.id), [branch])
   assert.equal(store.value.threads[0].sessions.codex.id, 'private-runtime-session')
   assert.doesNotMatch(JSON.stringify(exported), /private-runtime-session/)
 })
 
-test('agent notes persist as Markdown and are scoped to a conversation', async t => {
-  const calls = []
-  const { app, file } = workspace(t, async call => {
-    calls.push(call)
-    if (calls.length === 1) return { text: '记录验收决定。\n<rainbow-notes>\n' + JSON.stringify([
-      { op: 'write', file: '验收.md', markdown: '# 验收\n- 先检查导出功能约束。' },
-      { op: 'write', file: '进度.md', markdown: '# 进度\n- 初步验证已完成。' },
-    ]) + '\n</rainbow-notes>\n[交接:DeepSeek 娘]' }
-    if (calls.length === 3) return { text: '<rainbow-notes>\n' + JSON.stringify([
-      { op: 'delete', file: '验收.md' },
-    ]) + '\n</rainbow-notes>' }
-    return { text: '收到。' }
-  })
-  app.dispatch('threadSettings', { threadId: 'clubroom', description: '验证发布流程' })
-  app.dispatch('send', { threadId: 'clubroom', text: '记录关键决定', targetIds: ['codex'] })
-  await settled(app)
-  assert.equal(calls.length, 2)
-  assert.match(calls[1].prompt, /会话详情：验证发布流程/)
-  assert.match(calls[1].prompt, /当前会话笔记/)
-  assert.match(calls[1].prompt, /导出功能约束/)
-  const main = app.snapshot().threads[0]
-  assert.equal(main.messages[1].text, '记录验收决定。')
-  assert.equal(main.messages[1].handoffTo, 'deepseek')
-  assert.deepEqual(app.snapshot().threads[1].noteFiles, [])
-  assert.equal(readFileSync(join(file, '..', 'notes', 'clubroom', '验收.md'), 'utf8'), '# 验收\n- 先检查导出功能约束。\n')
-  assert.match(app.dispatch('readNote', { threadId: 'clubroom', file: '验收.md' }), /导出功能约束/)
-  assert.throws(() => app.dispatch('readNote', { threadId: 'ideas', file: '验收.md' }))
-  assert.throws(() => app.dispatch('deleteNote', { threadId: 'clubroom', file: '../workspace.json' }), /文件名/)
-  app.dispatch('send', { threadId: 'clubroom', text: '验收笔记过期了', targetIds: ['codex'] })
-  await settled(app)
-  assert.deepEqual(app.snapshot().threads[0].noteFiles, ['进度.md'])
-  assert.equal(app.snapshot().threads[0].messages.at(-1).text, '已更新会话笔记。')
-  app.dispatch('deleteNote', { threadId: 'clubroom', file: '进度.md' })
-  assert.deepEqual(app.snapshot().threads[0].noteFiles, [])
-})
-
-test('resuming after restart only supplies unseen history and changed or deleted notes', async t => {
+test('resuming after restart only supplies unseen history', async t => {
   const calls = []
   const run = async call => {
     calls.push(call)
@@ -456,52 +439,39 @@ test('resuming after restart only supplies unseen history and changed or deleted
   }
   const { app, file } = workspace(t, run)
   const threadId = 'clubroom'
-  app.notes.write(threadId, '变更.md', 'OLD-CONTENT')
-  app.notes.write(threadId, '保留.md', 'STABLE-NOTE')
-  app.notes.write(threadId, '移除.md', 'REMOVED-NOTE')
   app.dispatch('send', { threadId, text: 'FIRST-REQUEST', targetIds: ['codex'] })
   await settled(app)
-  assert.match(calls[0].prompt, /OLD-CONTENT/)
-  assert.match(calls[0].prompt, /STABLE-NOTE/)
 
   const reopened = new Conversations({ store: new Store(file), defaultDirectory: app.defaultDirectory, locate: app.locate, run, readCatalog: null })
-  reopened.notes.write(threadId, '变更.md', 'NEW-CONTENT')
-  reopened.dispatch('deleteNote', { threadId, file: '移除.md' })
   reopened.dispatch('send', { threadId, text: 'UNSEEN-MESSAGE', targetIds: [] })
   reopened.dispatch('send', { threadId, text: 'SECOND-REQUEST', targetIds: ['codex'] })
   await settled(reopened)
   assert.equal(calls[1].sessionId, 'codex-1')
   assert.match(calls[1].prompt, /UNSEEN-MESSAGE[\s\S]+SECOND-REQUEST/)
-  assert.match(calls[1].prompt, /NEW-CONTENT/)
-  assert.match(calls[1].prompt, /"deleted":\["移除\.md"\]/)
-  assert.doesNotMatch(calls[1].prompt, /FIRST-REQUEST|REPLY-1|OLD-CONTENT|STABLE-NOTE|REMOVED-NOTE/)
+  assert.doesNotMatch(calls[1].prompt, /FIRST-REQUEST|REPLY-1/)
 
   reopened.dispatch('send', { threadId, text: 'THIRD-REQUEST', targetIds: ['codex'] })
   await settled(reopened)
-  assert.doesNotMatch(calls[2].prompt, /NEW-CONTENT|STABLE-NOTE|移除\.md|UNSEEN-MESSAGE/)
+  assert.doesNotMatch(calls[2].prompt, /SECOND-REQUEST|UNSEEN-MESSAGE/)
 })
 
-test('handoff enriches an already queued role and brings referenced notes to a resumed session', async t => {
+test('handoff enriches an already queued role to a resumed session', async t => {
   const calls = []
   const { app } = workspace(t, async call => {
     calls.push(call)
-    return { sessionId: call.type, text: call.type === 'codex' ? '请检查约束.md 中的条目。\n[交接:DeepSeek 娘]' : '收到。' }
+    return { sessionId: call.type, text: call.type === 'codex' ? '请核对交付结果。\n[交接:DeepSeek 娘]' : '收到。' }
   })
   const threadId = 'clubroom'
-  app.notes.write(threadId, '约束.md', '测试'.repeat(1300) + '\nACCEPTANCE-DETAIL')
-  app.notes.write('ideas', '约束.md', 'OTHER-CONVERSATION')
   app.dispatch('send', { threadId, text: 'WARMUP', targetIds: ['deepseek'] })
   await settled(app)
-  assert.doesNotMatch(calls[0].prompt, /ACCEPTANCE-DETAIL/)
 
   app.dispatch('send', { threadId, text: 'ORIGINAL-REQUEST', targetIds: ['codex', 'deepseek'] })
   await settled(app)
   assert.deepEqual(calls.map(call => call.type), ['deepseek', 'codex', 'deepseek'])
   assert.equal(calls[2].sessionId, 'deepseek')
-  assert.match(calls[2].prompt, /ACCEPTANCE-DETAIL/)
   assert.match(calls[2].prompt, /本轮用户原始要求（供追溯）：\n"ORIGINAL-REQUEST"/)
-  assert.match(calls[2].prompt, /本轮指定的交接事项：\n"请检查约束\.md/)
-  assert.doesNotMatch(calls[2].prompt, /WARMUP|OTHER-CONVERSATION/)
+  assert.match(calls[2].prompt, /本轮指定的交接事项：\n"请核对交付结果/)
+  assert.doesNotMatch(calls[2].prompt, /WARMUP/)
   const messages = app.snapshot().threads[0].messages
   const sender = messages.at(-2)
   assert.equal(sender.handoffTo, 'deepseek')
@@ -510,12 +480,12 @@ test('handoff enriches an already queued role and brings referenced notes to a r
   app.dispatch('send', { threadId, text: 'UNRELATED-REQUEST', targetIds: [] })
   app.dispatch('inviteReply', { threadId, roleId: 'deepseek', messageId: sender.id })
   await settled(app)
-  assert.doesNotMatch(calls[3].prompt, /ACCEPTANCE-DETAIL|ORIGINAL-REQUEST/)
+  assert.doesNotMatch(calls[3].prompt, /ORIGINAL-REQUEST/)
   assert.match(calls[3].prompt, /本轮指定的交接事项/)
 })
 
 for (const [problem, code] of [['missing', 'RDS_SESSION_MISSING'], ['occupied', 'RDS_SESSION_BUSY']]) {
-  test(`an ${problem} native session is rebuilt once with notes and unrelated runtime errors are not retried`, async t => {
+  test(`an ${problem} native session is rebuilt once and unrelated runtime errors are not retried`, async t => {
     const calls = []
     const { app, store } = workspace(t, async call => {
       calls.push(call)
@@ -524,14 +494,12 @@ for (const [problem, code] of [['missing', 'RDS_SESSION_MISSING'], ['occupied', 
       return { text: '回复', sessionId: 'session-' + calls.length }
     })
     const threadId = 'clubroom'
-    app.notes.write(threadId, '决策.md', 'RECOVER-THIS-NOTE')
     for (const text of ['FIRST-REQUEST', 'SECOND-REQUEST', 'THIRD-REQUEST']) {
       app.dispatch('send', { threadId, text, targetIds: ['codex'] })
       await settled(app)
     }
     assert.deepEqual(calls.map(call => call.sessionId), [undefined, 'session-1', undefined, 'session-3'])
-    assert.doesNotMatch(calls[1].prompt, /RECOVER-THIS-NOTE|FIRST-REQUEST/)
-    assert.match(calls[2].prompt, /RECOVER-THIS-NOTE/)
+    assert.doesNotMatch(calls[1].prompt, /FIRST-REQUEST/)
     assert.match(calls[2].prompt, /FIRST-REQUEST[\s\S]*SECOND-REQUEST/)
     assert.equal(store.value.threads[0].sessions.codex.messageId, store.value.threads[0].messages[3].id)
     assert.equal(app.snapshot().threads[0].messages.at(-1).error, 'runtime interrupted')
@@ -709,8 +677,9 @@ test('composer references are scoped to the conversation and reach the selected 
   })
   const refs = new References()
   app.references = refs
-  app.notes.write('clubroom', '引用示例.md', '文件内容 CHECK-FILE-41')
-  const [file] = refs.paths('clubroom', [app.notes.file('clubroom', '引用示例.md')])
+  const filePath = join(app.defaultDirectory, '引用示例.md')
+  writeFileSync(filePath, '文件内容 CHECK-FILE-41')
+  const [file] = refs.paths('clubroom', [filePath])
   const [skill, plugin] = refs.register('clubroom', [
     { kind: 'skill', runtime: 'codex', name: 'fixture-skill', path: '/tmp/skills/fixture-skill/SKILL.md' },
     { kind: 'plugin', runtime: 'deepseek', name: 'fixture-plugin', key: 'plugin-fixture' },

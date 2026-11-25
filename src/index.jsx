@@ -206,7 +206,7 @@ function DeleteThreadDialog({ thread, hasReplies, close }) {
   const { error, busy, save } = useSave(close)
   return <Dialog title="删除会话" close={close}>
     <form className="stack" onSubmit={event => save(event, 'deleteThread', { threadId: thread.id })}>
-      <p className="dialog-note delete-note">将删除「{thread.name}」及其中的消息和笔记{hasReplies ? '，包括所有回复线程' : ''}。此操作无法撤销。</p>
+      <p className="dialog-note delete-note">将删除「{thread.name}」及其中的消息{hasReplies ? '，包括所有回复线程' : ''}。此操作无法撤销。</p>
       <FormFooter error={error} close={close} label="删除会话" busy={busy} danger />
     </form>
   </Dialog>
@@ -339,99 +339,74 @@ function ThreadMembersDialog({ thread, roles, close }) {
   </Dialog>
 }
 
-function DeleteNoteDialog({ thread, file, close }) {
-  const { error, busy, save } = useSave(close)
-  return <Dialog title="删除笔记" close={close}>
-    <form className="stack" onSubmit={event => save(event, 'deleteNote', { threadId: thread.id, file })}>
-      <p className="dialog-note delete-note">将删除「{file}」。此操作无法撤销。</p>
-      <FormFooter error={error} close={close} label="删除笔记" busy={busy} danger />
-    </form>
-  </Dialog>
-}
-
-function ProfileSettings({ profile }) {
-  const [name, setName] = useState(profile?.name || '')
-  const [avatar, setAvatar] = useState(undefined)
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
-  const [saved, setSaved] = useState(false)
+function ProfileSettings({ profile, name, avatar, onName, onAvatar, busy, onError, onPicking }) {
   const hasAvatar = avatar === undefined ? Boolean(profile?.avatarId) : Boolean(avatar)
-  const dirty = name.trim() !== (profile?.name || '') || avatar !== undefined
-
-  function changeAvatar(image) {
-    setAvatar(image)
-    setSaved(false)
-    setError('')
-  }
-
   async function pickAvatar() {
-    setBusy(true)
-    setError('')
+    onPicking(true)
+    onError('')
     try {
       const image = await api.pickAvatar()
-      if (image) changeAvatar(image)
-    } catch (failure) { setError(errorText(failure)) } finally { setBusy(false) }
+      if (image) onAvatar(image)
+    } catch (failure) { onError(errorText(failure)) } finally { onPicking(false) }
   }
+  return <fieldset className="stack profile-settings" disabled={busy}>
+    <legend>个人资料</legend>
+    <div className="profile-avatar-controls">
+      <Avatar user={{ name, avatarId: profile?.avatarId, avatar }} size="profile-preview" />
+      <button className="secondary-button" type="button" onClick={pickAvatar}>选择头像</button>
+      {hasAvatar && <button className="secondary-button" type="button"
+        onClick={() => onAvatar(profile?.avatarId ? null : undefined)}>移除头像</button>}
+    </div>
+    <label>显示名<input value={name} maxLength={36} placeholder="你" onChange={event => onName(event.target.value)} /></label>
+  </fieldset>
+}
 
-  async function saveProfile(event) {
+function storageSize(bytes) {
+  if (!Number.isFinite(bytes)) return '暂不可用'
+  if (bytes < 1024) return bytes + ' B'
+  if (bytes < 1024 ** 2) return (bytes / 1024).toFixed(1) + ' KB'
+  if (bytes < 1024 ** 3) return (bytes / 1024 ** 2).toFixed(1) + ' MB'
+  return (bytes / 1024 ** 3).toFixed(2) + ' GB'
+}
+
+function SettingsDialog({ settings, runtimes, memory, close }) {
+  const [data, setData] = useState(settings)
+  const [name, setName] = useState(settings.profile?.name || '')
+  const [avatar, setAvatar] = useState(undefined)
+  const [busy, setBusy] = useState(false)
+  const [picking, setPicking] = useState(false)
+  const [error, setError] = useState('')
+  const theme = appTheme(settings.theme)
+  const update = (name, value) => setData(prev => ({ ...prev, [name]: value }))
+  async function save(event) {
     event.preventDefault()
-    if (!dirty || busy) return
+    if (busy || picking) return
     setBusy(true)
     setError('')
     try {
-      await api.saveProfile({ name, avatar })
-      setName(name.trim())
-      setAvatar(undefined)
-      setSaved(true)
+      await api.saveSettings({ profile: { name, avatar }, codexPath: data.codexPath || '', deepseekPath: data.deepseekPath || '' })
+      close()
     } catch (failure) { setError(errorText(failure)) } finally { setBusy(false) }
   }
-
-  return <form className="profile-settings" onSubmit={saveProfile}>
-    <fieldset className="stack" disabled={busy}>
-      <legend>个人资料</legend>
-      <div className="profile-avatar-controls">
-        <Avatar user={{ name, avatarId: profile?.avatarId, avatar }} size="profile-preview" />
-        <button className="secondary-button" type="button" onClick={pickAvatar}>选择头像</button>
-        {hasAvatar && <button className="secondary-button" type="button"
-          onClick={() => changeAvatar(profile?.avatarId ? null : undefined)}>移除头像</button>}
-      </div>
-      <label>显示名<input value={name} maxLength={36} placeholder="你" onChange={event => {
-        setName(event.target.value)
-        setSaved(false)
-        setError('')
-      }} /></label>
-      {error && <div className="form-error" role="alert"><CircleAlert size={16} />{error}</div>}
-      <div className="profile-actions">
-        <span className="dialog-note" role="status">{saved && '已保存'}</span>
-        <button className="primary-button" type="submit" disabled={!dirty || busy}>保存个人资料</button>
-      </div>
-    </fieldset>
-  </form>
-}
-
-function SettingsDialog({ settings, runtimes, close }) {
-  const [data, setData] = useState(settings)
-  const { error, busy, save, setError } = useSave(close)
-  const theme = appTheme(settings.theme)
-  const update = (name, value) => setData(prev => ({ ...prev, [name]: value }))
   function changeTheme(event) {
     setError('')
     void api.run('appearanceSettings', { theme: event.currentTarget.value }).catch(failure => setError(errorText(failure)))
   }
   return <Dialog title="设置" close={close}>
-    <ProfileSettings profile={settings.profile} />
-    <fieldset className="appearance-settings">
-      <legend>主题</legend>
-      <div className="theme-options">
-        {[['light', '浅色', Sun], ['dark', '深色', Moon]].map(([id, label, Icon]) => <label key={id}>
-          <input type="radio" name="theme" value={id} checked={theme === id} onChange={changeTheme} />
-          <Icon size={16} aria-hidden="true" /><span>{label}</span>
-          {theme === id && <Check size={14} className="theme-selected" aria-hidden="true" />}
-        </label>)}
-      </div>
-    </fieldset>
-    <form className="stack" onSubmit={event => save(event, 'runtimeSettings', data)}>
-      <fieldset className="stack">
+    <form className="stack" onSubmit={save}>
+      <ProfileSettings profile={settings.profile} name={name} avatar={avatar} onName={setName} onAvatar={setAvatar}
+        busy={busy || picking} onError={setError} onPicking={setPicking} />
+      <fieldset className="appearance-settings" disabled={busy}>
+        <legend>主题</legend>
+        <div className="theme-options">
+          {[['light', '浅色', Sun], ['dark', '深色', Moon]].map(([id, label, Icon]) => <label key={id}>
+            <input type="radio" name="theme" value={id} checked={theme === id} onChange={changeTheme} />
+            <Icon size={16} aria-hidden="true" /><span>{label}</span>
+            {theme === id && <Check size={14} className="theme-selected" aria-hidden="true" />}
+          </label>)}
+        </div>
+      </fieldset>
+      <fieldset className="stack" disabled={busy}>
         <legend>运行时</legend>
         <p className="dialog-note">沿用 Codex 和 DSH 现有的登录。留空时自动查找已安装的客户端。</p>
         {runtimes.map(runtime => {
@@ -442,7 +417,13 @@ function SettingsDialog({ settings, runtimes, close }) {
           </span></label>
         })}
       </fieldset>
-      <FormFooter error={error} close={close} label="保存运行时设置" busy={busy} />
+      {memory && <fieldset className="stack">
+        <legend>角色记忆</legend>
+        <p className="dialog-note" role="status">{memory.error ? '部分功能暂不可用 · ' + memory.error
+          : memory.working ? '正在整理记忆' : '就绪'}{memory.pending ? ' · ' + memory.pending + ' 条经历待处理' : ''}</p>
+        <p className="dialog-note">记忆数据 {storageSize(memory.dataBytes)} · 内置模型 {storageSize(memory.modelBytes)}</p>
+      </fieldset>}
+      <FormFooter error={error} close={close} label="保存" busy={busy || picking} />
     </form>
   </Dialog>
 }
@@ -700,7 +681,6 @@ function Message({ message, draft, thread, roles, user, onReply, onInvite, onVie
       {message.handoffFrom && <div className="delivery-receipt"><Reply size={12} />接手来自 {message.handoffFrom} 的消息</div>}
       {handoff && <div className="delivery-receipt"><Send size={12} />交接给 {handoff.name}</div>}
       {message.taskError && <div className="delivery-receipt note-error"><CircleAlert size={12} />{message.taskError}</div>}
-      {message.noteError && <div className="delivery-receipt note-error"><CircleAlert size={12} />{message.noteError}</div>}
     </div>
   </article>
 }
@@ -1369,7 +1349,7 @@ function App() {
         <MembersPanel thread={thread} roles={roles} show={show} onView={openContent} open={membersOpen} />
         {contentOpen && <ContentPanel thread={contentThread} roles={state.roles} drafts={drafts} tabs={panel.tabs}
           active={panel.active} onSelect={id => updatePanel(current => ({ ...current, active: id }))} onView={openContent} onTabClose={closeTab} onTask={selectTask}
-          suspended={Boolean(dialog || menu || sidebar)} onNoteDelete={file => show({ type: 'deleteNote', threadId: thread.id, file })}
+          suspended={Boolean(dialog || menu || sidebar)}
           onReference={path => addAttachment({ path })} onResize={width => setContentWidth(Math.max(240, Math.min(innerWidth, Math.round(width))))} />}
       </React.Fragment> : <main className="empty-conversations"><MessageSquare size={27} /><h1>还没有会话</h1>
         <button className="primary-button" onClick={() => show({ type: 'room' })}><Plus size={16} />新建会话</button></main>}
@@ -1386,7 +1366,7 @@ function App() {
       } else show({ type, ...(menu.kind === 'group' ? { groupId: menu.id } : { threadId: menu.id }) })
     }} />}
     {dialog?.type === 'role' && <RoleDialog role={dialog.role} close={close} />}
-    {dialog?.type === 'settings' && <SettingsDialog settings={state.settings} runtimes={state.runtimes} close={close} />}
+    {dialog?.type === 'settings' && <SettingsDialog settings={state.settings} runtimes={state.runtimes} memory={state.memory} close={close} />}
     {dialog?.type === 'newGroup' && <GroupNameDialog close={close} />}
     {dialog?.type === 'renameGroup' && dialogGroup && <GroupNameDialog group={dialogGroup} close={close} />}
     {dialog?.type === 'deleteGroup' && dialogGroup && <DeleteGroupDialog group={dialogGroup} close={close} />}
@@ -1397,7 +1377,6 @@ function App() {
     {dialog?.type === 'sessionSettings' && dialogThread && <SessionSettings thread={dialogThread} defaultDirectory={state.defaultDirectory}
       computerAvailable={state.computerAvailable} close={close} />}
     {dialog?.type === 'threadRoles' && dialogThread && <ThreadMembersDialog thread={dialogThread} roles={state.roles} close={close} />}
-    {dialog?.type === 'deleteNote' && dialogThread && <DeleteNoteDialog thread={dialogThread} file={dialog.file} close={close} />}
     {dialog?.type === 'room' && <ThreadDialog roles={state.roles} defaultDirectory={state.defaultDirectory}
       computerAvailable={state.computerAvailable} close={close} onSaved={() => { close(); setPage('chat') }} />}
   </div>

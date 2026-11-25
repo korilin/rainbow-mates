@@ -7,6 +7,7 @@ import { basename, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { packager } from '@electron/packager'
 import { nextPackageVersion } from './package-version.mjs'
+import { stageMemoryResources } from './package-memory.mjs'
 
 if (process.platform !== 'darwin') throw new Error('请在 macOS 上构建应用包。')
 
@@ -56,11 +57,13 @@ async function packageMac() {
       await cp(join(project, folder), join(source, folder), { recursive: true })
     }
     await writeFile(join(source, 'package.json'), JSON.stringify({ name, productName, version, main, type, rainbowVersion: displayVersion }))
+    const embeddingModel = await stageMemoryResources(project, source, temporary)
     const [output] = await packager({
       dir: source, name: productName, platform: 'darwin', arch: process.arch, electronVersion,
       appVersion: version, buildVersion: macBuildVersion, extendInfo: { RainbowMatesVersion: displayVersion },
       appBundleId: 'build.rainbowdeskmates.desktop', appCategoryType: 'public.app-category.productivity',
-      icon, asar: { unpack: '**/*.node' }, prune: false,
+      icon, asar: { unpack: '**/*.{node,dylib}' }, prune: false,
+      extraResource: [embeddingModel],
       osxSign: {
         identity: '-', identityValidation: false, preAutoEntitlements: false, continueOnError: false,
         optionsForFile: () => ({ hardenedRuntime: false }),

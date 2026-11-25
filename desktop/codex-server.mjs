@@ -4,6 +4,7 @@ import { codexClientInfo } from './app-version.mjs'
 import { codexActivity, commandOutput } from './activity.mjs'
 
 const servers = new Map()
+const dedicatedServers = new Set()
 function userInput(text, references = []) {
   const skills = references.filter(item => item.kind === 'skill' && item.runtime === 'codex')
   const mentions = skills.map(item => '$' + (item.skillName || item.name)).join(' ')
@@ -13,12 +14,22 @@ function userInput(text, references = []) {
   ]
 }
 const errorText = error => error?.message || 'Codex app-server 未返回有效结果。'
+function runtimeFailure(error) {
+  const failure = new Error(errorText(error))
+  const detail = error?.codexErrorInfo
+  if (detail === 'contextWindowExceeded' || /context.window|context length|maximum context/i.test(failure.message)) {
+    failure.code = 'RDS_CONTEXT_LIMIT'
+  }
+  return failure
+}
 
 class AppServer {
-  constructor(binary, cwd, env, computerUrl) {
+  constructor(binary, cwd, env, computerUrl, memoryUrl) {
     const args = ['app-server', '--listen', 'stdio://', '-c', 'mcp_servers={}', '-c', 'plugins={}']
     if (computerUrl) args.push('-c', 'mcp_servers.rainbow_computer.url=' + JSON.stringify(computerUrl),
       '-c', 'mcp_servers.rainbow_computer.default_tools_approval_mode="approve"')
+    if (memoryUrl) args.push('-c', 'mcp_servers.rainbow_memory.url=' + JSON.stringify(memoryUrl),
+      '-c', 'mcp_servers.rainbow_memory.default_tools_approval_mode="approve"')
     this.child = spawn(binary, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
     this.requests = new Map()
     this.turns = new Map()
@@ -56,7 +67,7 @@ class AppServer {
       const finish = ({ result, error }) => {
         clearTimeout(timer)
         this.requests.delete(id)
-        if (error) reject(new Error(errorText(error)))
+        if (error) reject(runtimeFailure(error))
         else resolve(result)
       }
       const timer = setTimeout(() => finish({ error: { message: method + ' 超时。' } }), timeoutMs)
@@ -69,6 +80,7 @@ class AppServer {
   close(error = new Error('Codex app-server 已关闭。')) {
     if (this.closed) return
     this.closed = error
+    dedicatedServers.delete(this)
     this.child.kill()
     for (const finish of this.requests.values()) finish({ error })
     for (const turn of this.turns.values()) turn.fail(error)
@@ -76,15 +88,17 @@ class AppServer {
 }
 
 export function closeCodexServers() {
-  for (const server of servers.values()) server.close()
+  for (const server of [...servers.values(), ...dedicatedServers]) server.close()
   servers.clear()
 }
 
-function appServer(binary, cwd, env, computerUrl) {
-  let server = !computerUrl && servers.get(binary)
+function appServer(binary, cwd, env, computerUrl, memoryUrl) {
+  const dedicated = computerUrl || memoryUrl
+  let server = !dedicated && servers.get(binary)
   if (!server || server.closed) {
-    server = new AppServer(binary, cwd, env, computerUrl)
-    if (!computerUrl) servers.set(binary, server)
+    server = new AppServer(binary, cwd, env, computerUrl, memoryUrl)
+    if (dedicated) dedicatedServers.add(server)
+    else servers.set(binary, server)
   }
   return server
 }
@@ -103,8 +117,8 @@ async function resumeThread(server, threadId, settings) {
 }
 
 export async function runCodex({ binary, cwd, env, sessionId, prompt, model, effort, writeAccess, signal, onDraft, onSteer, onActivity, references,
-  computerUrl, timeoutMs = 15 * 60_000 }) {
-  const server = appServer(binary, cwd, env, computerUrl)
+  computerUrl, memoryUrl, onDelivered, onToolResult, ephemeral, timeoutMs = 15 * 60_000 }) {
+  const server = appServer(binary, cwd, env, computerUrl, memoryUrl)
   let threadId
   try {
     await server.ready
@@ -114,7 +128,7 @@ export async function runCodex({ binary, cwd, env, sessionId, prompt, model, eff
       ? { type: 'workspaceWrite', writableRoots: [cwd], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false }
       : { type: 'readOnly', networkAccess: false }
     const settings = { cwd, model, sandbox, approvalPolicy: 'never' }
-    const response = sessionId ? await resumeThread(server, sessionId, settings) : await server.request('thread/start', settings)
+    const response = sessionId ? await resumeThread(server, sessionId, settings) : await server.request('thread/start', { ...settings, ...(ephemeral && { ephemeral: true }) })
     threadId = response?.thread?.id
     if (!threadId) throw new Error('Codex app-server 未返回线程 ID。')
     signal.throwIfAborted()
@@ -122,7 +136,12 @@ export async function runCodex({ binary, cwd, env, sessionId, prompt, model, eff
       const assistant = new Map()
       const commandTails = new Map()
       let lastOutputAt = 0
-      let turnId, interrupted, interruptTimer, complete = false, mediaDelivered = false
+      let turnId, interrupted, interruptTimer, complete = false, mediaDelivered = false, delivered = false
+      const deliver = () => {
+        if (delivered) return
+        delivered = true
+        onDelivered?.(threadId)
+      }
       const finish = (error, result) => {
         if (complete) return
         complete = true
@@ -149,6 +168,7 @@ export async function runCodex({ binary, cwd, env, sessionId, prompt, model, eff
         fail: error => finish(interrupted || error),
         notify({ method, params }) {
           if (turnId && (params.turnId || params.turn?.id) !== turnId) return
+          if (!interrupted && (method.startsWith('item/') || method === 'turn/started')) deliver()
           if (method === 'item/commandExecution/outputDelta' && commandTails.has(params.itemId)) {
             const output = commandOutput(commandTails.get(params.itemId) + params.delta)
             commandTails.set(params.itemId, output)
@@ -168,6 +188,10 @@ export async function runCodex({ binary, cwd, env, sessionId, prompt, model, eff
             if (item.kind === 'asset') mediaDelivered = true
             onActivity?.(item)
           }
+          if (method === 'item/completed' && ['commandExecution', 'mcpToolCall', 'dynamicToolCall', 'webSearch', 'fileChange'].includes(params.item?.type)) {
+            const item = params.item
+            if (item.server !== 'rainbow_memory') onToolResult?.(item.id, item)
+          }
           if (method === 'item/agentMessage/delta') {
             const text = (assistant.get(params.itemId) || '') + params.delta
             assistant.set(params.itemId, text)
@@ -178,7 +202,7 @@ export async function runCodex({ binary, cwd, env, sessionId, prompt, model, eff
           } else if (method === 'turn/completed') {
             const turn = params.turn
             const text = [...assistant.values()].at(-1)?.trim()
-            if (interrupted || turn.status !== 'completed' || !text && !mediaDelivered) finish(interrupted || new Error(errorText(turn.error)))
+            if (interrupted || turn.status !== 'completed' || !text && !mediaDelivered) finish(interrupted || runtimeFailure(turn.error))
             else finish(null, { text: text || '图片已生成。', sessionId: threadId })
           }
         },
@@ -189,6 +213,7 @@ export async function runCodex({ binary, cwd, env, sessionId, prompt, model, eff
         turnId = value?.turn?.id
         if (!turnId) return finish(new Error('Codex app-server 未返回轮次 ID。'))
         if (interrupted) return interrupt(interrupted)
+        deliver()
         onSteer?.(async (text, id, refs) => {
           if (complete || interrupted) return false
           await server.request('turn/steer', { threadId, expectedTurnId: turnId, input: userInput(text, refs), clientUserMessageId: id }, 6000)
@@ -198,6 +223,6 @@ export async function runCodex({ binary, cwd, env, sessionId, prompt, model, eff
     })
   } finally {
     if (threadId && !server.closed) await server.request('thread/unsubscribe', { threadId }, 3000).catch(() => {})
-    if (computerUrl) server.close()
+    if (computerUrl || memoryUrl) server.close()
   }
 }
