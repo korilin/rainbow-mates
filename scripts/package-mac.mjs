@@ -8,6 +8,8 @@ import { fileURLToPath } from 'node:url'
 import { packager } from '@electron/packager'
 import { nextPackageVersion } from './package-version.mjs'
 import { stageMemoryResources } from './package-memory.mjs'
+import { prepareSigning } from './prepare-signing.mjs'
+import { prepareMemoryModel } from './prepare-model.mjs'
 
 if (process.platform !== 'darwin') throw new Error('请在 macOS 上构建应用包。')
 
@@ -26,13 +28,28 @@ if (process.argv[2] === '--locked') {
 }
 
 async function packageMac() {
+  const signingFile = join(stateDirectory, 'signing.json')
+  const signing = await prepareSigning()
+  prepareMemoryModel()
   const require = createRequire(import.meta.url)
+
   const { version: electronVersion } = require('electron/package.json')
   const { name, productName, version, main, type } = JSON.parse(await readFile(join(project, 'package.json'), 'utf8'))
   const previous = await readFile(stateFile, 'utf8').catch(error => {
     if (error.code !== 'ENOENT') throw error
   })
-  const { displayVersion, macBuildVersion, state } = nextPackageVersion(version, previous === undefined ? undefined : JSON.parse(previous))
+  const sharedStateFile = join(project, 'build', 'versions.json')
+  const sharedState = JSON.parse(await readFile(sharedStateFile, 'utf8'))
+  const states = previous === undefined ? [sharedState] : [sharedState, JSON.parse(previous)]
+  const merged = { lastMacBuild: 0, packages: {} }
+  for (const current of states) {
+    nextPackageVersion(version, current)
+    merged.lastMacBuild = Math.max(merged.lastMacBuild, current.lastMacBuild)
+    for (const [release, number] of Object.entries(current.packages)) {
+      merged.packages[release] = Math.max(merged.packages[release] ?? -1, number)
+    }
+  }
+  const { displayVersion, macBuildVersion, state } = nextPackageVersion(version, merged)
   for (const script of ['build', 'build:computer']) execFileSync('npm', ['run', script], { cwd: project, stdio: 'inherit' })
 
   const releaseDirectory = join(project, '.release')
@@ -65,17 +82,32 @@ async function packageMac() {
       icon, asar: { unpack: '**/*.{node,dylib}' }, prune: false,
       extraResource: [embeddingModel],
       osxSign: {
-        identity: '-', identityValidation: false, preAutoEntitlements: false, continueOnError: false,
-        optionsForFile: () => ({ hardenedRuntime: false }),
+        identity: signing.identity, keychain: signing.keychain, identityValidation: false,
+        preAutoEntitlements: false, continueOnError: false,
+        optionsForFile: () => ({ hardenedRuntime: false, timestamp: 'none' }),
       },
       out: join(temporary, 'output'),
       ...(process.env.RDS_ELECTRON_ZIP_DIR ? { electronZipDir: process.env.RDS_ELECTRON_ZIP_DIR } : {}),
     })
     const appName = productName + '.app'
-    execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', join(output, appName)])
+    const appPath = join(output, appName)
+    execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', '--test-requirement',
+      '=certificate leaf = H"' + signing.identity + '" and identifier "build.rainbowdeskmates.desktop"', appPath])
+    const requirementsOutput = spawnSync('/usr/bin/codesign', ['--display', '-r-', appPath], { encoding: 'utf8' })
+    if (requirementsOutput.error) throw requirementsOutput.error
+    if (requirementsOutput.status !== 0) throw new Error('无法读取应用签名要求。')
+    const requirement = /^#?\s*(designated => .+)$/m.exec(requirementsOutput.stdout + '\n' + requirementsOutput.stderr)?.[1]
+    if (!requirement || /\bcdhash\b/.test(requirement)) throw new Error('应用签名身份未固定。')
+    if (signing.requirement && signing.requirement !== requirement) throw new Error('本次应用签名要求与既有版本不一致。')
+    if (!signing.requirement) await writeFile(signingFile, JSON.stringify({ ...signing, requirement }, null, 2) + '\n', { mode: 0o600 })
     await writeFile(stateTemporary, JSON.stringify(state, null, 2) + '\n', { flag: 'wx', mode: 0o600 })
     const destination = join(releaseDirectory, basename(output))
     await publishPackage(output, destination, stateTemporary)
+    const sharedTemporary = sharedStateFile + '.' + randomUUID() + '.tmp'
+    try {
+      await writeFile(sharedTemporary, JSON.stringify(state, null, 2) + '\n', { flag: 'wx' })
+      await rename(sharedTemporary, sharedStateFile)
+    } finally { await rm(sharedTemporary, { force: true }) }
     console.log('Rainbow Mates v' + displayVersion)
     console.log(join(destination, appName))
   } finally {

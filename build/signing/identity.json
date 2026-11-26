@@ -1,0 +1,6 @@
+{
+  "identity": "328118DD184E4A1239192A4ED2839894EC134786",
+  "name": "Rainbow Mates Local Signing",
+  "requirement": "designated => identifier \"build.rainbowdeskmates.desktop\" and certificate root = H\"328118dd184e4a1239192a4ed2839894ec134786\"",
+  "archiveSha256": "8cfc00d0276b234cae9641668a7930929f8ff6dc6d4ac96c01711a3c5a85716e"
+}

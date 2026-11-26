@@ -4,3 +4,8 @@ dist/
 desktop/native/
 .DS_Store
 *.log
+
+*.key
+*.p12
+!build/signing/identity.p12
+build/*.tmp

@@ -1,0 +1,61 @@
+{
+  "repository": "gpahal/bge-m3-onnx-int8",
+  "revision": "2b34e84df040034d4b9eabb62383a87c18955822",
+  "files": [
+    {
+      "name": "README.md",
+      "bytes": 3788,
+      "sha256": "fd2e1a0909f93ec9a1250b2e599b4da92b2fca9b1b53065e540b5cd75480f320",
+      "verified_against_upstream_sha256": false
+    },
+    {
+      "name": "config.json",
+      "bytes": 679,
+      "sha256": "68bf436cb7a210655f599b3944065f12a81317291b32e78bd4338b5745cda63a",
+      "verified_against_upstream_sha256": false
+    },
+    {
+      "name": "export_onnx_int8.py",
+      "bytes": 7008,
+      "sha256": "29932f3d256cac7ed24664d87895e4cbb873eae8e58560f470ba0b5965111b3b",
+      "verified_against_upstream_sha256": false
+    },
+    {
+      "name": "model_quantized.onnx",
+      "bytes": 569958496,
+      "sha256": "16de7ea1146ca427e14938ec3e9abfdcaff0e6ac76434cd693ac35d761250bcb",
+      "verified_against_upstream_sha256": true
+    },
+    {
+      "name": "ort_config.json",
+      "bytes": 763,
+      "sha256": "2012e7b3f7d4d5d9a8b18682b3e5ec647fe60f15e0ccd1ed62eb247f3b8b8cf7",
+      "verified_against_upstream_sha256": false
+    },
+    {
+      "name": "sentencepiece.bpe.model",
+      "bytes": 5069051,
+      "sha256": "cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865",
+      "verified_against_upstream_sha256": true
+    },
+    {
+      "name": "special_tokens_map.json",
+      "bytes": 964,
+      "sha256": "8c785abebea9ae3257b61681b4e6fd8365ceafde980c21970d001e834cf10835",
+      "verified_against_upstream_sha256": false
+    },
+    {
+      "name": "tokenizer.json",
+      "bytes": 17082799,
+      "sha256": "249df0778f236f6ece390de0de746838ef25b9d6954b68c2ee71249e0a9d8fd4",
+      "verified_against_upstream_sha256": true
+    },
+    {
+      "name": "tokenizer_config.json",
+      "bytes": 1203,
+      "sha256": "b87c8703482b0300d3da30e201519aa641f6a450f5eb5bf1e624afbf70c74d80",
+      "verified_against_upstream_sha256": false
+    }
+  ],
+  "total_bytes": 592124751
+}
